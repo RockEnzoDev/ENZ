@@ -45,15 +45,22 @@ M5Core2 は小型音楽プレイヤーのオマケにチャット、CYD は部�
 | LILYGO T-Deck | [firmware/tdeck](firmware/tdeck) | オフラインチャットマシーン(ESP-NOW + LoRa、物理キーボード) | 実機確認済み(Phase 1) |
 | RP2350-USB (Tenstar) | [firmware/rp2350](firmware/rp2350) | USBボタン(F13)。シリーズの入力デバイス基盤 | コンパイル検証済み |
 
-今後の予定: Elecrow CrowPanel Advance、Heltec Wireless Paper
-(電子ペーパー掲示板、手持ち在庫から)、LILYGO T-Deck Plus
+今後の予定: Elecrow CrowPanel Advance(Room to Summit:部屋では
+センサー時計兼フォトフレーム、山ではフィールド端末)、Heltec Wireless
+Paper(電子ペーパー掲示板、手持ち在庫から)、LILYGO T-Deck Plus
 (GPS で位置を喋る係、手持ち在庫から)、M5Stick(ボイスレコーダーの
-オマケにチャット)、Stamp C3 無線コールボタン、RP2350 + ESP32-C3 ペア
-(ENZ BASE)、音声 PTT(CoT プロトコルの type 3 を予約済み)。
+オマケにチャット)、M5Stack PaperMono(候補:電子書籍リーダーの
+オマケにチャット。LoRa 付きは通常版のみ)、Stamp C3 無線コールボタン、
+RP2350 + ESP32-C3 ペア(ENZ BASE)、音声 PTT(CoT プロトコルの
+type 3 を予約済み)。
 手持ちの Meshtastic 機材(Unit C6L ×2、Wio Tracker L1 Pro、Cardputer ADV、
 T-Echo Lite、XIAO nRF52 / ESP32 + Wio-SX1262 キット ×各3)も順次
 CoT ノード化する。ESP32 系は ESP-NOW + LoRa のフルノードに、nRF52 系は
 LoRa 専用ノードとして T-Deck のブリッジ経由で家族に合流する想定。
+
+実験と失敗の記録は [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) に
+残します。失敗も資産として公開し、分からないことは「知りたいこと」
+として明記します。見てくれた人が答えを持っているかもしれないので。
 
 ## 共通資産
 
