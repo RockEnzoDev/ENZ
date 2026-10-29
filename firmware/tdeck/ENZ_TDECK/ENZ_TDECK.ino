@@ -449,6 +449,7 @@ static int chatLineCount = 0;
 static int curPeer = -1;             // conversation shown on the chat screen
 static int chatChannel = 1;
 static bool chatLR = false;
+static int loraProf = 0;   // LoRa modem profile: 0 = CoT Std, 1 = Narrow (pref "chat"/"lprof")
 static bool chatOn = false;
 static unsigned long lastHello = 0;
 struct RxSlot { uint8_t mac[6]; uint8_t data[sizeof(MsgPacket)]; int len; };
@@ -484,10 +485,12 @@ static void loadChatPrefs() {
   prefs.begin("chat", true);
   chatChannel = prefs.getInt("ch", 1);
   chatLR = prefs.getBool("lr", false);
+  loraProf = prefs.getInt("lprof", 0);
+  if (loraProf < 0 || loraProf > 1) loraProf = 0;
   prefs.end();
   if (chatChannel < 1 || chatChannel > 13) chatChannel = 1;
 }
-static void saveChatPrefs() { prefs.begin("chat", false); prefs.putInt("ch", chatChannel); prefs.putBool("lr", chatLR); prefs.end(); }
+static void saveChatPrefs() { prefs.begin("chat", false); prefs.putInt("ch", chatChannel); prefs.putBool("lr", chatLR); prefs.putInt("lprof", loraProf); prefs.end(); }
 static void pushChatLine(const String& line) {
   if (chatLineCount == MAX_CHAT_MSGS) {
     for (int i = 1; i < MAX_CHAT_MSGS; i++) chatLines[i - 1] = chatLines[i];
@@ -654,10 +657,12 @@ void processChatRx() {
 
 // ============================================================
 //  LoRa TEXT (SX1262 via RadioLib) -- 920 MHz JP low-power plan:
-//  921.0 MHz, BW125, SF8, CR 4/5, TX 13 dBm, LBT (CAD) before TX.
+//  920.8 MHz, TX 13 dBm, LBT (CAD) before TX. Modem profile (Settings):
+//  Std = BW125 / SF8 / CR 4/5 (CoT standard), Narrow = BW62.5 / SF8 /
+//  CR 4/6 (aligned with the JP Meshtastic/MeshCore NarrowSlow experiment).
 //  Frame: [type][nameLen][name][text]  HELLO every 90 s.
 // ============================================================
-#define LORA_FREQ 921.0f
+#define LORA_FREQ 920.8f
 static SX1262 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 static bool loraReady = false;
 static volatile bool loraRxFlag = false;
@@ -667,7 +672,7 @@ static int loraHeardRssi = 0;
 static uint16_t loraMsgId = 1;
 static void loraIsr() { loraRxFlag = true; }
 static bool loraInit() {
-  int st = radio.begin(LORA_FREQ, 125.0f, 8, 5, 0x12, 13, 8);
+  int st = radio.begin(LORA_FREQ, loraProf ? 62.5f : 125.0f, 8, loraProf ? 6 : 5, 0x12, 13, 8);
   if (st != RADIOLIB_ERR_NONE) return false;
   radio.setDio1Action(loraIsr);
   st = radio.startReceive();
@@ -1262,8 +1267,8 @@ static void drawHomeCard() {
     snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "");
     txt(b1, 16, 100, UI_TEXT, 1);
     if (loraReady) {
-      if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 921.0 SF8  %s  %ddBm", loraHeardName.c_str(), loraHeardRssi);
-      else snprintf(b2, sizeof(b2), "LoRa 921.0 SF8  listening");
+      if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 920.8 %s  %s  %ddBm", loraProf ? "NARROW" : "STD", loraHeardName.c_str(), loraHeardRssi);
+      else snprintf(b2, sizeof(b2), "LoRa 920.8 %s  listening", loraProf ? "NARROW" : "STD");
     } else snprintf(b2, sizeof(b2), "LoRa -- (not found)");
     txt(b2, 16, 118, UI_DIM, 1);
   }
@@ -1435,10 +1440,10 @@ static void drawSettings() {
   const int x = 8, w = SCR_W - 16;
   int y = 28;
   auto row = [&](const char* label, const String& value) {
-    card(x, y, w, 24);
-    txt(label, x + 10, y + 5, UI_DIM, 1);
-    jpText(fitText(value, 190).c_str(), x + 118, y + 5, UI_TEXT, -1);
-    y += 26;
+    card(x, y, w, 20);
+    txt(label, x + 10, y + 3, UI_DIM, 1);
+    jpText(fitText(value, 190).c_str(), x + 118, y + 3, UI_TEXT, -1);
+    y += 22;
   };
   if (editingName) row("Name*", editBuf + "_");
   else row("Name", myName);
@@ -1455,6 +1460,7 @@ static void drawSettings() {
   }
   row("Bright", String(brightnessVal));
   row("Cursor", cursorMode == 0 ? "Auto" : (cursorMode == 1 ? "ON" : "OFF"));
+  row("LoRa", loraProf ? "Narrow" : "Std");
 }
 // ---- time set ----
 static int tsF[6] = {2026, 1, 1, 0, 0, 0};
@@ -1665,12 +1671,12 @@ static void handleTouch(int tx, int ty) {
     case SC_SET: {
       if (editingName || editingAlt) {
         int er = editingName ? 0 : 4;
-        if (ty >= 28 && (ty - 28) / 26 == er) { editingName = editingAlt = false; needsRedraw = true; }
+        if (ty >= 28 && (ty - 28) / 22 == er) { editingName = editingAlt = false; needsRedraw = true; }
         break;
       }
       if (ty < 24 && tx < 50) { goHome(); break; }
-      int rowIdx = (ty - 28) / 26;
-      if (ty >= 28 && rowIdx >= 0 && rowIdx < 8) {
+      int rowIdx = (ty - 28) / 22;
+      if (ty >= 28 && rowIdx >= 0 && rowIdx < 9) {
         if (rowIdx == 0) { editingName = true; editingAlt = false; editBuf = myName; }
         else if (rowIdx == 1) { if (chatOn) chatStop(); else chatStart(); }
         else if (rowIdx == 2) { chatChannel = chatChannel % 13 + 1; saveChatPrefs(); if (chatOn) { chatStop(); chatStart(); } }
@@ -1690,6 +1696,11 @@ static void handleTouch(int tx, int ty) {
         else if (rowIdx == 7) {
           cursorMode = (cursorMode + 1) % 3;
           prefs.begin("sys", false); prefs.putInt("cur", cursorMode); prefs.end();
+        }
+        else if (rowIdx == 8) {
+          loraProf = loraProf ? 0 : 1;
+          saveChatPrefs();
+          loraInit();
         }
         needsRedraw = true;
       }
@@ -1797,7 +1808,7 @@ void setup() {
   chatStart();
   bootLine(chatOn ? "ESP-NOW ............ ON" : "ESP-NOW ............ FAIL");
   bool lr = loraInit();
-  bootLine(lr ? "LoRa 921.0 SF8 ..... RX" : "LoRa ............... FAIL");
+  bootLine(lr ? "LoRa 920.8MHz ..... RX" : "LoRa ............... FAIL");
   i2sOut = new AudioOutputI2S();
   i2sOut->SetPinout(PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DOUT);
   applyGain();

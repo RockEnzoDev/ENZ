@@ -38,7 +38,12 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
 
 日本の ARIB STD-T108(920 MHz 帯 特定小電力)に沿うこと。
 
-- 周波数 921.0 MHz、帯域幅 125 kHz、SF8、符号化率 4/5
+- 周波数 920.8 MHz(JP の Meshtastic / MeshCore 実験に合わせて統一)
+- 変調プロファイルは切替式:
+  - Std(標準): 帯域幅 125 kHz、SF8、符号化率 4/5
+  - Narrow: 帯域幅 62.5 kHz、SF8、符号化率 4/6
+    (NarrowSlow 実験と物理層を合わせたもの。Meshtastic そのものとの
+    相互運用を保証するものではない)
 - 送信電力 13 dBm 以下、送信前にキャリアセンス(LBT)必須
 - フレーム: `[type][id16][nameLen][name][text]`
 - HELLO は 90 秒ごと

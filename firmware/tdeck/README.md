@@ -6,7 +6,8 @@ ESP-NOW と LoRa の両対応で、ホーム画面は CYD 風
 
 ## 機能
 
-- チャット: ESP-NOW(CYD / M5Core2 と互換)+ LoRa(921.0 MHz、STD-T108 準拠)
+- チャット: ESP-NOW(CYD / M5Core2 と互換)+ LoRa(920.8 MHz、STD-T108 準拠。
+  設定で変調プロファイル Std / Narrow を切替可能)
   ホームのターミナルからは両方に同時送信
 - 日本語入力: **Alt+C** で英数/日本語を切替(Alt+Space はキーボード
   ファーム側で検出できないため)。SKK 変換は Space、候補送りは n / N
