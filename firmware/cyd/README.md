@@ -30,3 +30,5 @@
 
 直下に `jpfont16.bin` と `skk.dic`(リポジトリの assets/sd)、
 フォルダ `/music`、`/picture`、`/chats`(自動作成)。
+`presshist.bin` は気圧の 24 時間履歴(CLEAN 版が自動で読み書き。
+Launcher 等でファームを入れ替えてもグラフが残るように SD に保存)

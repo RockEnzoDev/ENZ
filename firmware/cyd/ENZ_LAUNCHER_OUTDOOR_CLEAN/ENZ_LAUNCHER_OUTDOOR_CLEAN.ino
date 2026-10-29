@@ -1945,10 +1945,27 @@ static bool prDirty = false; static uint32_t prLastSave = 0;
 static bool prTimeValid() { return time(nullptr) > 1700000000; }
 static uint32_t prNow() { return prTimeValid() ? (uint32_t)time(nullptr) : prBase + millis() / 1000; }
 
+// SD mirror of the history (added 2026-10-29): the NVS copy lives in the
+// app's partition table, so a Launcher install can strand it; the SD card
+// is the same medium under every firmware, so the history survives there.
+#define PR_SD_PATH "/presshist.bin"
+static bool prSdLoaded = false;
+static void prSaveSd() {
+  if (!sdReady) return;
+  File f = SD.open(PR_SD_PATH, FILE_WRITE);
+  if (!f) return;
+  f.write((const uint8_t *)"ENZP", 4);
+  uint16_t n = (uint16_t)prCount;
+  f.write((const uint8_t *)&n, 2);
+  if (prCount > 0) f.write((const uint8_t *)prHist, prCount * sizeof(PrSample));
+  f.close();
+}
+
 void prSave() {
   prefs.begin("baro", false);
   prefs.putBytes("hist", prHist, prCount * sizeof(PrSample));
   prefs.end();
+  prSaveSd();
   prDirty = false; prLastSave = prNow();
 }
 void prLoad() {
@@ -1973,6 +1990,23 @@ void pressureTick() {
   if (now - lastCheck < 20000UL && lastCheck != 0) return;
   lastCheck = now;
   uint32_t t = prNow();
+  if (!prSdLoaded && sdReady) {          // one-shot: adopt the SD history when it is the fresher copy
+    prSdLoaded = true;
+    File f = SD.open(PR_SD_PATH, FILE_READ);
+    if (f) {
+      char magic[4]; uint16_t n = 0;
+      bool ok = f.read((uint8_t *)magic, 4) == 4 && memcmp(magic, "ENZP", 4) == 0 &&
+                f.read((uint8_t *)&n, 2) == 2 && n > 0 && n <= PR_N &&
+                (size_t)f.size() >= 6 + (size_t)n * sizeof(PrSample);
+      static PrSample tmp[PR_N];
+      if (ok) ok = f.read((uint8_t *)tmp, n * sizeof(PrSample)) == (int)(n * sizeof(PrSample));
+      f.close();
+      if (ok && (prCount == 0 || tmp[n - 1].t >= prHist[prCount - 1].t)) {
+        memcpy(prHist, tmp, n * sizeof(PrSample)); prCount = n;
+        prBase = prHist[prCount - 1].t + PR_STEP_S;
+      }
+    }
+  }
   if (prCount == 0 || t >= prHist[prCount - 1].t + PR_STEP_S) {
     if (lastBmpMs == 0 || now - lastBmpMs > 15000UL) bmpPoll();             // measure unless the clock screen just did
     if (pressOK && now - lastBmpMs < 15000UL) prAdd(t, inPress);
