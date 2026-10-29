@@ -101,7 +101,7 @@ static bool gtTouch(int *outX, int *outY) {
 #define KC_NORMAL UI_CARD
 #define KC_ACT    Lcd.color565(10, 48, 22)
 
-enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_MUSIC, SC_TRACKS, SC_SET, SC_TIMESET };
+enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_MUSIC, SC_TRACKS, SC_SET, SC_TIMESET, SC_RAW };
 static Screen screen = SC_HOME;
 static bool needsRedraw = true;
 static Preferences prefs;
@@ -449,7 +449,7 @@ static int chatLineCount = 0;
 static int curPeer = -1;             // conversation shown on the chat screen
 static int chatChannel = 1;
 static bool chatLR = false;
-static int loraProf = 0;   // LoRa modem profile: 0 = CoT Std, 1 = Narrow (pref "chat"/"lprof")
+static int loraProf = 0;   // LoRa modem profile: 0 = CoT Std, 1 = Narrow, 2 = MeshCore listen (pref "chat"/"lprof")
 static bool chatOn = false;
 static unsigned long lastHello = 0;
 struct RxSlot { uint8_t mac[6]; uint8_t data[sizeof(MsgPacket)]; int len; };
@@ -486,7 +486,7 @@ static void loadChatPrefs() {
   chatChannel = prefs.getInt("ch", 1);
   chatLR = prefs.getBool("lr", false);
   loraProf = prefs.getInt("lprof", 0);
-  if (loraProf < 0 || loraProf > 1) loraProf = 0;
+  if (loraProf < 0 || loraProf > 2) loraProf = 0;
   prefs.end();
   if (chatChannel < 1 || chatChannel > 13) chatChannel = 1;
 }
@@ -659,7 +659,9 @@ void processChatRx() {
 //  LoRa TEXT (SX1262 via RadioLib) -- 920 MHz JP low-power plan:
 //  920.8 MHz, TX 13 dBm, LBT (CAD) before TX. Modem profile (Settings):
 //  Std = BW125 / SF8 / CR 4/5 (CoT standard), Narrow = BW62.5 / SF8 /
-//  CR 4/6 (aligned with the JP Meshtastic/MeshCore NarrowSlow experiment).
+//  CR 4/6 (Meshtastic NarrowSlow experiment). MeshCore = BW62.5 / SF8 /
+//  CR 4/5, listen-only for now: raw packets go to the RAW log screen and
+//  CoT LoRa TX (HELLO + chat relay) stays off in that profile.
 //  Frame: [type][nameLen][name][text]  HELLO every 90 s.
 // ============================================================
 #define LORA_FREQ 920.8f
@@ -670,9 +672,14 @@ static unsigned long loraLastHello = 0, loraHeardAt = 0;
 static String loraHeardName = "";
 static int loraHeardRssi = 0;
 static uint16_t loraMsgId = 1;
+struct RawPkt { uint32_t at; int rssi; uint8_t len; uint8_t data[32]; };
+#define RAW_N 8
+static RawPkt rawLog[RAW_N];
+static int rawCount = 0;
+static uint32_t rawTotal = 0;
 static void loraIsr() { loraRxFlag = true; }
 static bool loraInit() {
-  int st = radio.begin(LORA_FREQ, loraProf ? 62.5f : 125.0f, 8, loraProf ? 6 : 5, 0x12, 13, 8);
+  int st = radio.begin(LORA_FREQ, loraProf == 0 ? 125.0f : 62.5f, 8, loraProf == 1 ? 6 : 5, 0x12, 13, 8);
   if (st != RADIOLIB_ERR_NONE) return false;
   radio.setDio1Action(loraIsr);
   st = radio.startReceive();
@@ -681,7 +688,7 @@ static bool loraInit() {
   return true;
 }
 static bool loraSendFrame(uint8_t type, const String& text) {
-  if (!loraReady) return false;
+  if (!loraReady || loraProf == 2) return false;
   String nm = u8cut(myName, 15);
   int nl = nm.length(), tl = text.length();
   if (tl > 190) tl = 190;
@@ -708,10 +715,18 @@ static void loraPoll() {
   if (!loraReady) return;
   if (loraRxFlag) {
     loraRxFlag = false;
-    uint8_t buf[224];
+    uint8_t buf[255];
     int len = radio.getPacketLength();
     int st = (len > 0 && len <= (int)sizeof(buf)) ? radio.readData(buf, len) : RADIOLIB_ERR_NONE;
-    if (st == RADIOLIB_ERR_NONE && len >= 4) {
+    if (st == RADIOLIB_ERR_NONE && len >= 1) {
+      if (loraProf == 2) {
+        RawPkt rp; rp.at = millis(); rp.rssi = (int)radio.getRSSI(); rp.len = (uint8_t)min(len, 255);
+        memcpy(rp.data, buf, min(len, 32));
+        memmove(&rawLog[1], &rawLog[0], sizeof(RawPkt) * (RAW_N - 1));
+        rawLog[0] = rp; if (rawCount < RAW_N) rawCount++;
+        rawTotal++;
+        if (screen == SC_RAW) needsRedraw = true;
+      } else if (len >= 4) {
       uint8_t type = buf[0];
       int nl = buf[3];
       if (nl <= 15 && 4 + nl <= len) {
@@ -730,9 +745,10 @@ static void loraPoll() {
           if (screen != SC_CHAT) needsRedraw = true;
         }
       }
+      }
     }
   }
-  if (millis() - loraLastHello > 90000UL) {
+  if (loraProf != 2 && millis() - loraLastHello > 90000UL) {
     loraLastHello = millis();
     loraSendFrame(1, "");
   }
@@ -1267,7 +1283,8 @@ static void drawHomeCard() {
     snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "");
     txt(b1, 16, 100, UI_TEXT, 1);
     if (loraReady) {
-      if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 920.8 %s  %s  %ddBm", loraProf ? "NARROW" : "STD", loraHeardName.c_str(), loraHeardRssi);
+      if (loraProf == 2) snprintf(b2, sizeof(b2), "LoRa 920.8 MESHCR  RX %lu pkts", rawTotal);
+      else if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 920.8 %s  %s  %ddBm", loraProf ? "NARROW" : "STD", loraHeardName.c_str(), loraHeardRssi);
       else snprintf(b2, sizeof(b2), "LoRa 920.8 %s  listening", loraProf ? "NARROW" : "STD");
     } else snprintf(b2, sizeof(b2), "LoRa -- (not found)");
     txt(b2, 16, 118, UI_DIM, 1);
@@ -1377,7 +1394,31 @@ static void drawPeers() {
   if (loraReady && loraHeardAt) snprintf(lb, sizeof(lb), "LoRa last: %s (%ddBm, %lus ago)", loraHeardName.c_str(), loraHeardRssi, (millis() - loraHeardAt) / 1000);
   else snprintf(lb, sizeof(lb), "LoRa: %s", loraReady ? "listening" : "not found");
   txt(lb, 10, 204, UI_MUTE, 1);
-  txt("TAP or trackball+press to open", 10, 220, UI_MUTE, 1);
+  txt("tap peer to open - bottom bar: RAW LOG", 10, 220, UI_MUTE, 1);
+}
+static void drawRaw() {
+  Lcd.fillScreen(UI_BG);
+  drawHeader("LoRa RAW");
+  txt("920.8 BW62.5 SF8 CR5 - MeshCore listen", 10, 26, UI_DIM, 1);
+  char hb[48];
+  snprintf(hb, sizeof(hb), "packets: %lu (latest %d shown)", rawTotal, min(rawCount, 4));
+  txt(hb, 10, 38, UI_MUTE, 1);
+  if (rawCount == 0) txt("No packets yet - is the peer on air?", 10, 62, UI_MUTE, 1);
+  int y = 58;
+  for (int i = 0; i < rawCount && i < 4; i++) {
+    RawPkt& rp = rawLog[i];
+    char lb[48];
+    snprintf(lb, sizeof(lb), "%dB  %ddBm  %lus ago", rp.len, rp.rssi, (millis() - rp.at) / 1000);
+    txt(lb, 10, y, UI_TEXT, 1);
+    int n = min((int)rp.len, 32);
+    for (int r = 0; r < 2; r++) {
+      char hx[52]; int pos = 0;
+      for (int j = r * 16; j < n && j < r * 16 + 16; j++) pos += snprintf(hx + pos, sizeof(hx) - pos, "%02X ", rp.data[j]);
+      if (pos) txt(hx, 10, y + 11 + r * 11, UI_DIM, 1);
+    }
+    y += 38;
+  }
+  txt("ESC / tap top-left: back to peers", 10, 224, UI_MUTE, 1);
 }
 // ---- music screens (same layout language as the M5 build) ----
 static void drawMusicScreen() {
@@ -1460,7 +1501,7 @@ static void drawSettings() {
   }
   row("Bright", String(brightnessVal));
   row("Cursor", cursorMode == 0 ? "Auto" : (cursorMode == 1 ? "ON" : "OFF"));
-  row("LoRa", loraProf ? "Narrow" : "Std");
+  row("LoRa", loraProf == 1 ? "Narrow" : (loraProf == 2 ? "MeshCore" : "Std"));
 }
 // ---- time set ----
 static int tsF[6] = {2026, 1, 1, 0, 0, 0};
@@ -1494,6 +1535,7 @@ static void drawCurrent() {
     case SC_HOME: drawHome(); break;
     case SC_CHAT: drawChat(); break;
     case SC_PEERS: drawPeers(); break;
+    case SC_RAW: drawRaw(); break;
     case SC_MUSIC: drawMusicScreen(); break;
     case SC_TRACKS: drawTracks(); break;
     case SC_SET: drawSettings(); break;
@@ -1574,7 +1616,11 @@ static void handleKey(int c) {
         loadChatLines(curPeer);
         screen = SC_CHAT;
         needsRedraw = true;
-      } else if (c == 0x1B) goHome();
+      } else if (c == 'r' || c == 'R') { screen = SC_RAW; needsRedraw = true; }
+      else if (c == 0x1B) goHome();
+      break;
+    case SC_RAW:
+      if (c == 0x1B || c == 0x0D) { screen = SC_PEERS; needsRedraw = true; }
       break;
     case SC_SET:
       if (c == 0x1B) goHome();
@@ -1630,6 +1676,7 @@ static void handleTouch(int tx, int ty) {
       break;
     case SC_PEERS:
       if (ty < 24 && tx < 50) { goHome(); break; }
+      if (ty >= 196) { screen = SC_RAW; needsRedraw = true; break; }
       if (ty >= 28) {
         int i = (ty - 28) / 22;
         if (i >= 0 && i < chatPeerCount) {
@@ -1640,6 +1687,9 @@ static void handleTouch(int tx, int ty) {
           needsRedraw = true;
         }
       }
+      break;
+    case SC_RAW:
+      if (ty < 24 && tx < 50) { screen = SC_PEERS; needsRedraw = true; }
       break;
     case SC_MUSIC:
       if (ty < 24 && tx < 50) { goHome(); break; }
@@ -1698,7 +1748,7 @@ static void handleTouch(int tx, int ty) {
           prefs.begin("sys", false); prefs.putInt("cur", cursorMode); prefs.end();
         }
         else if (rowIdx == 8) {
-          loraProf = loraProf ? 0 : 1;
+          loraProf = (loraProf + 1) % 3;
           saveChatPrefs();
           loraInit();
         }
@@ -1899,6 +1949,7 @@ void loop() {
   if (tbp && !wasTbPress) {
     if (cursorActive()) handleTouch(curX, curY);
     else if (screen == SC_PEERS) handleKey(0x0D);
+    else if (screen == SC_RAW) { screen = SC_PEERS; needsRedraw = true; }
     else if (screen == SC_TRACKS) handleKey(0x0D);
     else if (screen == SC_HOME) { screen = SC_CHAT; needsRedraw = true; }
   }

@@ -44,6 +44,11 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
   - Narrow: 帯域幅 62.5 kHz、SF8、符号化率 4/6
     (NarrowSlow 実験と物理層を合わせたもの。Meshtastic そのものとの
     相互運用を保証するものではない)
+- 実験中: MeshCore リスニングプロファイル(920.8 MHz、帯域幅 62.5 kHz、
+  SF8、符号化率 4/5)。このプロファイルでは CoT の LoRa 送信を止め、
+  受信した生パケットを RAW ログ画面に記録する。将来の目標は
+  ESP-NOW(CoT 家族)⇄ MeshCore のブリッジ
+  (LoRa メッシュの隙間を ESP-NOW で埋めるラストワンマイル構成)
 - 送信電力 13 dBm 以下、送信前にキャリアセンス(LBT)必須
 - フレーム: `[type][id16][nameLen][name][text]`
 - HELLO は 90 秒ごと
