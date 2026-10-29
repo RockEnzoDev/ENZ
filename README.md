@@ -46,7 +46,8 @@ M5Core2 は小型音楽プレイヤーのオマケにチャット、CYD は部�
 | RP2350-USB (Tenstar) | [firmware/rp2350](firmware/rp2350) | USBボタン(F13)。シリーズの入力デバイス基盤 | コンパイル検証済み |
 
 今後の予定: Elecrow CrowPanel Advance、Heltec Wireless Paper
-(電子ペーパー掲示板、手持ち在庫から)、M5Stick(ボイスレコーダーの
+(電子ペーパー掲示板、手持ち在庫から)、LILYGO T-Deck Plus
+(GPS で位置を喋る係、手持ち在庫から)、M5Stick(ボイスレコーダーの
 オマケにチャット)、Stamp C3 無線コールボタン、RP2350 + ESP32-C3 ペア
 (ENZ BASE)、音声 PTT(CoT プロトコルの type 3 を予約済み)。
 
