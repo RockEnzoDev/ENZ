@@ -1,9 +1,11 @@
 // ============================================================
-//  ENZ T-DECK  --  LILYGO T-Deck (original, ESP32-S3) companion
-//  DOS-green family firmware: clock + I2C sensors (option),
-//  ESP-NOW chat (byte-compatible with the CYD / M5Core2 units),
-//  LoRa text chat (920 MHz band, JP low-power rules), music.
-//  v1 draft: text only. LoRa bridge and voice PTT come later.
+//  ENZ T-DECK v14 "RADIO BANCHO" -- LILYGO T-Deck companion
+//  The all-radio terminal of the ENZ CoT family: ESP-NOW chat
+//  (byte-compatible with CYD / M5Core2), LoRa text + MeshCore
+//  monitor, Si4703 FM radio (RDS), and on the T-Deck Plus an
+//  onboard-GPS position beacon + cached GSI map viewer.
+//  No clock UI (GPS time quietly sets the system clock), no
+//  music, no onboard sensors -- radios only.
 // ============================================================
 #include <Arduino.h>
 #define LILYGO_LGFX_USE_T_DECK
@@ -17,10 +19,7 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include <RadioLib.h>
-#include <AudioFileSourceSD.h>
-#include <AudioGeneratorMP3.h>
-#include <AudioGeneratorWAV.h>
-#include <AudioOutputI2S.h>
+#include <TJpg_Decoder.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -101,7 +100,7 @@ static bool gtTouch(int *outX, int *outY) {
 #define KC_NORMAL UI_CARD
 #define KC_ACT    Lcd.color565(10, 48, 22)
 
-enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_MUSIC, SC_TRACKS, SC_SET, SC_TIMESET, SC_RAW };
+enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_SET, SC_RAW, SC_RADIO, SC_GPS, SC_MAP };
 static Screen screen = SC_HOME;
 static bool needsRedraw = true;
 static Preferences prefs;
@@ -292,135 +291,6 @@ static int wrapText(const String& txtIn, int maxW, String* out, int maxN) {
 
 
 
-// ============================================================
-//  SENSORS on I2C (option): AHT20 humidity/temp + BME/BMP280
-//  pressure. Auto-detected; the keyboard shares this bus (0x55).
-// ============================================================
-static bool sensAHT = false, sensBME = false, sensBMP = false;
-static float senT = NAN, senH = NAN, senP = NAN;   // degC, %RH, hPa (sea-level corrected)
-static float senPraw = NAN;
-static int pressAltM = 0;
-static void i2cWrite(uint8_t addr, std::initializer_list<uint8_t> b) {
-  Wire.beginTransmission(addr);
-  for (uint8_t v : b) Wire.write(v);
-  Wire.endTransmission();
-}
-static bool i2cProbe(uint8_t addr) {
-  Wire.beginTransmission(addr);
-  return Wire.endTransmission() == 0;
-}
-static bool ahtInit() {
-  if (!i2cProbe(0x38)) return false;
-  i2cWrite(0x38, {0xBE, 0x08, 0x00});
-  delay(10);
-  return true;
-}
-static bool ahtRead(float& t, float& h) {
-  i2cWrite(0x38, {0xAC, 0x33, 0x00});
-  delay(80);
-  if (Wire.requestFrom(0x38, 6) != 6) return false;
-  uint8_t b[6];
-  for (int i = 0; i < 6; i++) b[i] = Wire.read();
-  if (b[0] & 0x80) return false;
-  uint32_t rh = ((uint32_t)b[1] << 12) | ((uint32_t)b[2] << 4) | (b[3] >> 4);
-  uint32_t tt = ((uint32_t)(b[3] & 0x0F) << 16) | ((uint32_t)b[4] << 8) | b[5];
-  h = rh * 100.0f / 1048576.0f;
-  t = tt * 200.0f / 1048576.0f - 50.0f;
-  return true;
-}
-// BME280/BMP280 register driver (Bosch datasheet compensation)
-static uint8_t bmeAddr = 0x76;
-static uint16_t dT1, dP1; static int16_t dT2, dT3, dP2, dP3, dP4, dP5, dP6, dP7, dP8, dP9;
-static uint8_t dH1, dH3; static int16_t dH2, dH4, dH5; static int8_t dH6;
-static void bmeReadRegs(uint8_t reg, uint8_t* buf, int n) {
-  Wire.beginTransmission(bmeAddr); Wire.write(reg); Wire.endTransmission(false);
-  Wire.requestFrom((int)bmeAddr, n);
-  for (int i = 0; i < n; i++) buf[i] = Wire.available() ? Wire.read() : 0;
-}
-static uint16_t bmeU16(const uint8_t* b) { return b[0] | ((uint16_t)b[1] << 8); }
-static bool bmeInit() {
-  for (uint8_t a : {0x76, 0x77}) {
-    bmeAddr = a;
-    if (!i2cProbe(a)) continue;
-    uint8_t id = 0; bmeReadRegs(0xD0, &id, 1);
-    if (id != 0x60 && id != 0x58) continue;
-    sensBME = (id == 0x60); sensBMP = (id != 0x60);
-    uint8_t c[26]; bmeReadRegs(0x88, c, 26);
-    dT1 = bmeU16(c); dT2 = (int16_t)bmeU16(c + 2); dT3 = (int16_t)bmeU16(c + 4);
-    dP1 = bmeU16(c + 6); dP2 = (int16_t)bmeU16(c + 8); dP3 = (int16_t)bmeU16(c + 10);
-    dP4 = (int16_t)bmeU16(c + 12); dP5 = (int16_t)bmeU16(c + 14); dP6 = (int16_t)bmeU16(c + 16);
-    dP7 = (int16_t)bmeU16(c + 18); dP8 = (int16_t)bmeU16(c + 20); dP9 = (int16_t)bmeU16(c + 22);
-    dH1 = c[25];
-    if (sensBME) {
-      uint8_t e[7]; bmeReadRegs(0xE1, e, 7);
-      dH2 = (int16_t)bmeU16(e); dH3 = e[2];
-      dH4 = (int16_t)((e[3] << 4) | (e[4] & 0x0F));
-      dH5 = (int16_t)((e[5] << 4) | (e[4] >> 4));
-      dH6 = (int8_t)e[6];
-      i2cWrite(bmeAddr, {0xF2, 0x01});           // osrs_h x1
-    }
-    i2cWrite(bmeAddr, {0xF4, 0x27});             // osrs_t/p x1, normal mode
-    i2cWrite(bmeAddr, {0xF5, 0xA0});             // standby 1000 ms, filter off
-    return true;
-  }
-  return false;
-}
-static int32_t bmeTf = 0;
-static bool bmeRead(float& t, float& h, float& p) {
-  uint8_t b[8]; bmeReadRegs(0xF7, b, 8);
-  int32_t adcP = ((uint32_t)b[0] << 12) | ((uint32_t)b[1] << 4) | (b[2] >> 4);
-  int32_t adcT = ((uint32_t)b[3] << 12) | ((uint32_t)b[4] << 4) | (b[5] >> 4);
-  int32_t adcH = ((uint32_t)b[6] << 8) | b[7];
-  int32_t v1 = ((((adcT >> 3) - ((int32_t)dT1 << 1))) * (int32_t)dT2) >> 11;
-  int32_t v2 = (((((adcT >> 4) - (int32_t)dT1) * ((adcT >> 4) - (int32_t)dT1)) >> 12) * (int32_t)dT3) >> 14;
-  bmeTf = v1 + v2;
-  t = ((bmeTf * 5 + 128) >> 8) / 100.0f;
-  int64_t pv1 = (int64_t)bmeTf - 128000;
-  int64_t pv2 = pv1 * pv1 * (int64_t)dP6 + ((pv1 * (int64_t)dP5) << 17) + ((int64_t)dP4 << 35);
-  pv1 = ((pv1 * pv1 * (int64_t)dP3) >> 8) + ((pv1 * (int64_t)dP2) << 12);
-  pv1 = (((int64_t)1 << 47) + pv1) * (int64_t)dP1 >> 33;
-  if (pv1 == 0) return false;
-  int64_t pp = 1048576 - adcP;
-  pp = (((pp << 31) - pv2) * 3125) / pv1;
-  pv1 = ((int64_t)dP9 * (pp >> 13) * (pp >> 13)) >> 25;
-  pv2 = ((int64_t)dP8 * pp) >> 19;
-  pp = ((pp + pv1 + pv2) >> 8) + ((int64_t)dP7 << 4);
-  p = pp / 256.0f / 100.0f;
-  if (sensBME) {
-    int32_t hv = bmeTf - 76800;
-    hv = (((((adcH << 14) - ((int32_t)dH4 << 20) - ((int32_t)dH5 * hv)) + 16384) >> 15) *
-          (((((((hv * (int32_t)dH6) >> 10) * (((hv * (int32_t)dH3) >> 11) + 32768)) >> 10) + 2097152) * (int32_t)dH2 + 8192) >> 14)) >> 15;
-    hv -= (((((hv >> 15) * (hv >> 15)) >> 7) * (int32_t)dH1) >> 4);
-    if (hv < 0) hv = 0; if (hv > 419430400) hv = 419430400;
-    h = (hv >> 12) / 1024.0f;
-  } else h = NAN;
-  return true;
-}
-static bool sensorsPresent() { return sensAHT || sensBME || sensBMP; }
-static void sensorsPoll() {
-  if (sensAHT) { float t, h; if (ahtRead(t, h)) { senT = t; senH = h; } }
-  if (sensBME || sensBMP) {
-    float t, h, p;
-    if (bmeRead(t, h, p)) {
-      senPraw = p;
-      if (!sensAHT) { senT = t; if (!isnan(h)) senH = h; }
-    }
-  }
-  if (!isnan(senPraw)) senP = senPraw / powf(1.0f - pressAltM / 44330.0f, 5.255f);
-}
-// pressure history: one sample / 10 min, 24 h ring (for the home mini graph)
-static float prHist[144];
-static int prCount = 0, prHead = 0;
-static unsigned long prLastSample = 0;
-static void prSample(bool force = false) {
-  if (isnan(senP)) return;
-  if (!force && millis() - prLastSample < 600000UL) return;
-  prLastSample = millis();
-  prHist[prHead] = senP;
-  prHead = (prHead + 1) % 144;
-  if (prCount < 144) prCount++;
-}
-static float prAt(int i) { return prHist[(prHead - prCount + i + 288) % 144]; }   // i: 0 = oldest
 
 
 // ============================================================
@@ -440,7 +310,8 @@ static_assert(sizeof(MsgPacket) == 223, "packet size");
 #define CHAT_DIR "/chats"
 #define HELLO_INTERVAL_MS 5000
 #define PEER_TIMEOUT_MS 30000
-struct ChatPeer { uint8_t mac[6]; char name[16]; unsigned long lastSeen; bool hasUnread; };
+struct ChatPeer { uint8_t mac[6]; char name[16]; unsigned long lastSeen; bool hasUnread;
+                  int32_t latE6; int32_t lonE6; int16_t altM; unsigned long posAt; };
 static ChatPeer chatPeers[MAX_PEERS];
 static int chatPeerCount = 0;
 static uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -522,6 +393,7 @@ static int findOrAddPeer(const uint8_t* mac) {
   chatPeers[idx].name[0] = 0;
   chatPeers[idx].lastSeen = 0;
   chatPeers[idx].hasUnread = false;
+  chatPeers[idx].latE6 = 0; chatPeers[idx].lonE6 = 0; chatPeers[idx].altM = 0; chatPeers[idx].posAt = 0;
   return idx;
 }
 static int ensureGroupPeer() {
@@ -650,6 +522,13 @@ void processChatRx() {
       }
       chatDirty = true;
       if (screen != SC_CHAT) needsRedraw = true;   // home badges / terminal
+    } else if (m.type == 4) {                // POS beacon: "latE6,lonE6,altM"
+      long la = 0, lo = 0; int al = 0;
+      if (sscanf(m.text, "%ld,%ld,%d", &la, &lo, &al) == 3) {
+        chatPeers[idx].latE6 = (int32_t)la; chatPeers[idx].lonE6 = (int32_t)lo;
+        chatPeers[idx].altM = (int16_t)al; chatPeers[idx].posAt = millis();
+        if (screen == SC_PEERS || screen == SC_MAP) needsRedraw = true;
+      }
     }
   }
   if (chatOn && millis() - lastHello > HELLO_INTERVAL_MS) { lastHello = millis(); sendHello(); }
@@ -780,6 +659,19 @@ static void loraPoll() {
           else if (gi >= 0) chatPeers[gi].hasUnread = true;
           chatDirty = true;
           if (screen != SC_CHAT) needsRedraw = true;
+        } else if (type == 3) {   // LoRa POS beacon, attributed by name
+          String text = String((const char*)buf + 4 + nl).substring(0, len - 4 - nl);
+          long la = 0, lo = 0; int al = 0;
+          if (sscanf(text.c_str(), "%ld,%ld,%d", &la, &lo, &al) == 3) {
+            for (int i = 0; i < chatPeerCount; i++) {
+              if (name == peerName(i)) {
+                chatPeers[i].latE6 = (int32_t)la; chatPeers[i].lonE6 = (int32_t)lo;
+                chatPeers[i].altM = (int16_t)al; chatPeers[i].posAt = millis();
+                if (screen == SC_PEERS || screen == SC_MAP) needsRedraw = true;
+                break;
+              }
+            }
+          }
         }
       }
       }
@@ -1053,195 +945,458 @@ static void drawComposerLine(int x, int y, uint16_t baseCol) {
 
 
 // ============================================================
-//  MUSIC (MP3 + WAV from /music, ESP8266Audio -> I2S MAX98357A)
-//  Decode task pattern (same lesson as the M5 build): the UI loop
-//  never touches the decoder; controls only set request flags.
+//  FM RADIO (Si4703 on the shared I2C bus, addr 0x10) -- RDS
+//  station name + radiotext. Audio leaves the module on its
+//  own 3.5 mm jack (earphones double as the antenna); nothing
+//  is routed through the ESP32. Register values follow the
+//  Si4703 datasheet / Linux si470x driver. The module needs
+//  SDA/SCL/3.3V/GND (Grove port); RST is assumed pulled up on
+//  the breakout, so init is bus-only.
 // ============================================================
-#define MAX_TRACKS 64
-static String musicNames[MAX_TRACKS];
-static int musicCount = 0;
-static volatile int musicCur = -1;
-static int musicTop = 0;
-static volatile bool musicPlaying = false, musicPaused = false;
-static int musicVol = 200;
-static volatile unsigned long musicElapsedBase = 0, musicPlayStarted = 0;
-static AudioOutputI2S* i2sOut = nullptr;
-static AudioGenerator* gen = nullptr;
-static AudioFileSourceSD* srcFile = nullptr;
-static AudioGeneratorMP3* gMp3 = nullptr;
-static AudioGeneratorWAV* gWav = nullptr;
-static volatile int reqPlay = -1;
-static volatile bool reqStop = false;
-static volatile uint32_t musicPosSnap = 0, musicSizeSnap = 0;   // UI reads these, never srcFile
-static bool hasAudioExt(const String& n) {
-  String l = n; l.toLowerCase();
-  return l.endsWith(".mp3") || l.endsWith(".wav");
-}
-void musicScan() {
-  musicCount = 0;
-  if (!sdReady) return;
-  File dir = SD.open("/music");
-  if (!dir) return;
-  File f;
-  while ((f = dir.openNextFile())) {
-    if (!f.isDirectory() && musicCount < MAX_TRACKS) {
-      String n = String(f.name());
-      int slash = n.lastIndexOf('/');
-      if (slash >= 0) n = n.substring(slash + 1);
-      if (n.length() && n[0] != '.' && hasAudioExt(n)) musicNames[musicCount++] = n;
-    }
-    f.close();
-  }
-  dir.close();
-}
-static void doStop() {
-  if (gen) gen->stop();
-  if (gMp3) { delete gMp3; gMp3 = nullptr; }
-  if (gWav) { delete gWav; gWav = nullptr; }
-  gen = nullptr;
-  if (srcFile) { delete srcFile; srcFile = nullptr; }
-  musicPlaying = false;
-  musicPaused = false;
-  musicPosSnap = 0; musicSizeSnap = 0;
-  if (screen == SC_MUSIC) needsRedraw = true;
-}
-static bool doPlay(int idx) {
-  if (idx < 0 || idx >= musicCount) return false;
-  doStop();
-  String path = "/music/" + musicNames[idx];
-  srcFile = new AudioFileSourceSD(path.c_str());
-  String l = musicNames[idx]; l.toLowerCase();
-  bool ok = false;
-  if (l.endsWith(".mp3")) { gMp3 = new AudioGeneratorMP3(); gen = gMp3; ok = gMp3->begin(srcFile, i2sOut); }
-  else                    { gWav = new AudioGeneratorWAV(); gen = gWav; ok = gWav->begin(srcFile, i2sOut); }
-  if (!ok) { doStop(); return false; }
-  musicCur = idx;
-  musicPosSnap = 0;
-  musicSizeSnap = srcFile ? srcFile->getSize() : 0;
-  musicPlaying = true;
-  musicPaused = false;
-  musicElapsedBase = 0;
-  musicPlayStarted = millis();
-  if (screen == SC_MUSIC) needsRedraw = true;
-  return true;
-}
-static void musicTask(void*) {
-  for (;;) {
-    if (reqStop) { reqStop = false; doStop(); }
-    if (reqPlay >= 0) { int i = reqPlay; reqPlay = -1; doPlay(i); }
-    if (gen && musicPlaying && !musicPaused) {
-      bool alive = gen->loop();
-      if (srcFile) { musicPosSnap = srcFile->getPos(); musicSizeSnap = srcFile->getSize(); }
-      if (!alive) {
-        int n = (int)musicCur + 1;
-        if (n < musicCount) doPlay(n); else doStop();
-      }
-    } else {
-      vTaskDelay(10);
-    }
+#define FM_ADDR 0x10
+static bool fmPresent = false;
+static uint16_t fmR[16];              // register shadow, indexed by register number
+static int fmKhz = 81300;              // 81.3 MHz default (Tokyo-ish FM)
+static int fmVol = 10;                 // SYSCONFIG2 volume 0..15
+static bool fmStereo = false;
+static int fmRssi = 0;
+static String fmPS = "";               // RDS program service name
+static String fmRT = "";               // RDS radiotext
+static char fmPsBuf[9] = "";
+static uint8_t fmPsMask = 0;
+static char fmRtBuf[65] = "";
+static int fmRtAB = -1;
+static void fmReadRegs() {
+  if (Wire.requestFrom(FM_ADDR, 32) != 32) return;
+  uint16_t order[16] = {0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
+  for (int i = 0; i < 16; i++) {
+    int hi = Wire.read(), lo = Wire.read();
+    if (hi < 0 || lo < 0) return;
+    fmR[order[i]] = (uint16_t)((hi << 8) | lo);
   }
 }
-void musicStop() { reqPlay = -1; reqStop = true; }
-bool musicPlay(int idx) {
-  if (idx < 0 || idx >= musicCount) return false;
-  reqStop = false;
-  reqPlay = idx;
-  return true;
+static void fmWriteRegs() {            // writes registers 0x02..0x07
+  Wire.beginTransmission(FM_ADDR);
+  for (int r = 0x02; r <= 0x07; r++) { Wire.write((uint8_t)(fmR[r] >> 8)); Wire.write((uint8_t)(fmR[r] & 0xFF)); }
+  Wire.endTransmission();
 }
-void musicTogglePause() {
-  if (!musicPlaying) { if (musicCur >= 0) musicPlay((int)musicCur); return; }
-  if (musicPaused) { musicPaused = false; musicPlayStarted = millis(); }
-  else { musicElapsedBase += (millis() - musicPlayStarted) / 1000; musicPaused = true; }
-  if (screen == SC_MUSIC) needsRedraw = true;
-}
-void musicNext() { if (musicCount) { int n = (int)musicCur + 1; if (n >= musicCount) n = 0; musicPlay(n); } }
-void musicPrev() { if (musicCount) { int n = (int)musicCur - 1; if (n < 0) n = musicCount - 1; musicPlay(n); } }
-static unsigned long musicElapsedSec() {
-  if (!musicPlaying) return 0;
-  if (musicPaused) return musicElapsedBase;
-  return musicElapsedBase + (millis() - musicPlayStarted) / 1000;
-}
-static float musicProgress() {
-  // Snapshot values maintained by the decode task. The UI must never touch
-  // srcFile/gen: they belong to the decode task, and racing them from the
-  // UI wedged the whole interface the moment playback started.
-  uint32_t sz = musicSizeSnap;
-  if (!sz) return 0;
-  float r = (float)musicPosSnap / (float)sz;
-  return r > 1.0f ? 1.0f : r;
-}
-void loadMusicVol() {
-  prefs.begin("music", true);
-  musicVol = prefs.getInt("vol", 200);
+static void fmSavePrefs() { prefs.begin("fm", false); prefs.putInt("khz", fmKhz); prefs.putInt("vol", fmVol); prefs.end(); }
+static void loadFmPrefs() {
+  prefs.begin("fm", true);
+  fmKhz = prefs.getInt("khz", 81300);
+  fmVol = prefs.getInt("vol", 10);
   prefs.end();
-  if (musicVol < 0) musicVol = 0;
-  if (musicVol > 255) musicVol = 255;
+  if (fmKhz < 76000 || fmKhz > 108000) fmKhz = 81300;
+  if (fmVol < 0 || fmVol > 15) fmVol = 10;
 }
-void saveMusicVol() { prefs.begin("music", false); prefs.putInt("vol", musicVol); prefs.end(); }
-static void applyGain() { if (i2sOut) i2sOut->SetGain(musicVol / 255.0f); }
-static String trackTitle(int idx) {
-  String n = musicNames[idx];
-  int dot = n.lastIndexOf('.');
-  if (dot > 0) n = n.substring(0, dot);
+static bool fmWaitStc() {
+  for (int i = 0; i < 60; i++) { fmReadRegs(); if (fmR[0x0A] & 0x4000) return true; delay(10); }
+  return false;
+}
+static void fmTune(int khz) {
+  if (!fmPresent) return;
+  if (khz < 76000) khz = 76000;
+  if (khz > 108000) khz = 108000;
+  uint16_t chan = (uint16_t)((khz - 76000) / 100);
+  fmR[0x03] = (uint16_t)(0x8000 | chan);          // TUNE | CHAN
+  fmWriteRegs();
+  fmWaitStc();
+  fmR[0x03] &= (uint16_t)~0x8000;                  // clear TUNE
+  fmWriteRegs();
+  fmReadRegs();
+  fmKhz = 76000 + (int)(fmR[0x0B] & 0x03FF) * 100; // READCHAN
+  fmPsMask = 0; fmPS = ""; fmRT = ""; fmRtAB = -1;
+  memset(fmRtBuf, 0, sizeof(fmRtBuf));
+  fmSavePrefs();
+}
+static bool fmInit() {
+  Wire.beginTransmission(FM_ADDR);
+  if (Wire.endTransmission() != 0) { fmPresent = false; return false; }
+  fmPresent = true;
+  fmReadRegs();
+  fmR[0x07] = 0x8100;                              // TEST1: crystal oscillator on
+  fmWriteRegs();
+  fmR[0x02] |= 0x4001;                             // POWERCFG: DMUTE | ENABLE
+  fmWriteRegs();
+  delay(110);                                      // oscillator start-up
+  fmReadRegs();
+  fmR[0x04] |= 0x1000;                             // SYSCONFIG1: RDS on
+  fmR[0x05] = (uint16_t)((fmR[0x05] & 0xFF00) | 0x0040 | 0x0010 | (fmVol & 0x0F));  // BAND 76-108, SPACE 100 kHz, volume
+  fmWriteRegs();
+  fmTune(fmKhz);
+  return true;
+}
+static void fmSeek(bool up) {
+  if (!fmPresent) return;
+  fmReadRegs();
+  fmR[0x02] |= (uint16_t)(0x0200 | (up ? 0x0400 : 0));   // SEEK | SEEKUP
+  fmWriteRegs();
+  fmWaitStc();
+  fmReadRegs();
+  bool edge = (fmR[0x0A] & 0x2000) != 0;                  // SF/BL
+  fmR[0x02] &= (uint16_t)~0x0200;                          // clear SEEK
+  fmWriteRegs();
+  fmKhz = 76000 + (int)(fmR[0x0B] & 0x03FF) * 100;
+  if (edge) { /* wrapped at the band edge: READCHAN already reflects it */ }
+  fmPsMask = 0; fmPS = ""; fmRT = ""; fmRtAB = -1;
+  memset(fmRtBuf, 0, sizeof(fmRtBuf));
+  fmSavePrefs();
+}
+static void fmVolSet(int v) {
+  if (v < 0) v = 0;
+  if (v > 15) v = 15;
+  fmVol = v;
+  if (fmPresent) {
+    fmReadRegs();
+    fmR[0x05] = (uint16_t)((fmR[0x05] & 0xFFF0) | (fmVol & 0x0F));
+    fmWriteRegs();
+  }
+  fmSavePrefs();
+}
+static void fmPoll() {                     // called from loop() on the radio screen
+  if (!fmPresent) return;
+  static unsigned long last = 0;
+  if (millis() - last < 150) return;
+  last = millis();
+  fmReadRegs();
+  fmStereo = (fmR[0x0A] & 0x0100) != 0;
+  fmRssi = fmR[0x0A] & 0x00FF;
+  if (!(fmR[0x0A] & 0x8000)) return;       // RDSR: no new RDS group
+  uint16_t b = fmR[0x0D];                  // RDSB
+  int gtype = (b >> 12) & 0x0F;
+  int gver = (b >> 11) & 0x01;
+  bool dirty = false;
+  if (gtype == 0) {                        // PS name: 2 chars per segment in RDSD
+    int seg = b & 0x03;
+    char c1 = (char)(fmR[0x0F] >> 8), c2 = (char)(fmR[0x0F] & 0xFF);
+    if (fmPsBuf[seg * 2] != c1 || fmPsBuf[seg * 2 + 1] != c2) {
+      fmPsBuf[seg * 2] = c1; fmPsBuf[seg * 2 + 1] = c2;
+      fmPsMask |= (uint8_t)(1 << seg);
+      dirty = true;
+    }
+    if (fmPsMask == 0x0F) { String s = String(fmPsBuf); s.trim(); if (s != fmPS) { fmPS = s; dirty = true; } }
+  } else if (gtype == 2 && gver == 0) {    // radiotext (2A): 4 chars per segment
+    int ab = (b >> 4) & 0x01;
+    if (ab != fmRtAB) { fmRtAB = ab; memset(fmRtBuf, 0, sizeof(fmRtBuf)); }
+    int seg = b & 0x0F;
+    char cs[4] = { (char)(fmR[0x0E] >> 8), (char)(fmR[0x0E] & 0xFF), (char)(fmR[0x0F] >> 8), (char)(fmR[0x0F] & 0xFF) };
+    bool ch = false;
+    for (int i = 0; i < 4; i++) {
+      char c = cs[i] == '\r' ? 0 : cs[i];
+      if (fmRtBuf[seg * 4 + i] != c) { fmRtBuf[seg * 4 + i] = c; ch = true; }
+    }
+    if (ch) { String s = String(fmRtBuf); s.trim(); if (s != fmRT) { fmRT = s; dirty = true; } }
+  }
+  if (dirty && screen == SC_RADIO) needsRedraw = true;
+}
+static void drawRadio() {
+  Lcd.fillScreen(UI_BG);
+  drawHeader("FM RADIO");
+  if (!fmPresent) {
+    txt("Si4703 not found (I2C 0x10)", 12, 44, UI_WARN, 1);
+    txt("Wire the module to the Grove I2C port:", 12, 74, UI_DIM, 1);
+    txt("SDA / SCL / 3.3V / GND, RST pulled up.", 12, 90, UI_DIM, 1);
+    txt("Audio: earphones on the module jack", 12, 116, UI_TEXT, 1);
+    txt("(the earphone cable is the antenna).", 12, 132, UI_DIM, 1);
+    return;
+  }
+  char fb[16];
+  snprintf(fb, sizeof(fb), "%d.%d", fmKhz / 1000, (fmKhz % 1000) / 100);
+  Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(3); Lcd.setTextColor(UI_ACCENT, UI_BG);
+  Lcd.setTextDatum(lgfx::textdatum_t::top_left);
+  Lcd.drawString(fb, 16, 36);
+  Lcd.setTextSize(1); Lcd.setTextColor(UI_DIM, UI_BG);
+  Lcd.drawString("MHz", 150, 58);
+  if (fmPS.length()) jpText(fitText(fmPS, 296).c_str(), 16, 92, UI_TEXT, -1);
+  else txt("... RDS ...", 16, 92, UI_MUTE, 1);
+  if (fmRT.length()) {
+    String rest = fmRT;
+    String l1 = fitText(rest, 296);
+    jpText(l1.c_str(), 16, 116, UI_DIM, -1);
+    if (l1.length() < rest.length()) {
+      String l2 = rest.substring(l1.length());
+      l2.trim();
+      jpText(fitText(l2, 296).c_str(), 16, 134, UI_DIM, -1);
+    }
+  }
+  char sb[40];
+  snprintf(sb, sizeof(sb), "%s  RSSI %d  VOL %d", fmStereo ? "STEREO" : "MONO", fmRssi, fmVol);
+  txt(sb, 16, 160, UI_MUTE, 1);
+  hbtn(6, 186, 70, 40, "SEEK-", KC_NORMAL, UI_TEXT);
+  hbtn(82, 186, 70, 40, "SEEK+", KC_NORMAL, UI_TEXT);
+  hbtn(158, 186, 70, 40, "VOL-", KC_NORMAL, UI_TEXT);
+  hbtn(234, 186, 74, 40, "VOL+", KC_NORMAL, UI_TEXT);
+}
+
+// ============================================================
+//  GPS (T-Deck Plus onboard, UART1) -- NMEA GGA/RMC parsed by
+//  hand. Auto-detected: original T-Decks simply never receive
+//  a sentence, so every GPS feature stays hidden there. The
+//  RX/TX order differs between board revs, so if nothing has
+//  arrived 20 s after boot the pins are swapped once.
+//  A valid RMC also sets the system clock (quiet corner clock
+//  on the home screen) -- GPS is this family's RTC.
+// ============================================================
+#define GPS_RX_PIN 44
+#define GPS_TX_PIN 43
+static bool gpsPresent = false;      // any valid NMEA seen
+static bool gpsFix = false;
+static int32_t gpsLatE6 = 0, gpsLonE6 = 0;
+static float gpsAltM = 0, gpsSpeedKmh = 0;
+static int gpsSats = 0;
+static unsigned long gpsFixAt = 0, lastBeaconAt = 0;
+static bool gpsSwapped = false, gpsTimeSet = false;
+static void gpsInit() { Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); }
+static int64_t daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+static int32_t nmeaCoordE6(const char* v, char hemi) {
+  float f = (float)atof(v);
+  int deg = (int)(f / 100.0f);
+  float mn = f - deg * 100.0f;
+  double dec = deg + mn / 60.0;
+  if (hemi == 'S' || hemi == 'W') dec = -dec;
+  return (int32_t)lround(dec * 1000000.0);
+}
+static int nmeaField(char* line, int idx, char* out, int cap) {   // 0-based field copy, returns length
+  int f = 0; const char* p = line;
+  while (f < idx && *p) { if (*p == ',') f++; p++; }
+  int n = 0;
+  while (*p && *p != ',' && *p != '*' && n < cap - 1) out[n++] = *p++;
+  out[n] = 0;
   return n;
 }
+static void gpsHandleLine(char* line) {
+  char fld[24];
+  if (strstr(line, "GGA") == line + 3) {           // $??GGA
+    nmeaField(line, 6, fld, sizeof(fld));
+    int fixq = atoi(fld);
+    nmeaField(line, 7, fld, sizeof(fld)); gpsSats = atoi(fld);
+    if (fixq > 0) {
+      char ns, ew, la[20], lo[20];
+      nmeaField(line, 2, la, sizeof(la)); nmeaField(line, 3, fld, sizeof(fld)); ns = fld[0];
+      nmeaField(line, 4, lo, sizeof(lo)); nmeaField(line, 5, fld, sizeof(fld)); ew = fld[0];
+      gpsLatE6 = nmeaCoordE6(la, ns);
+      gpsLonE6 = nmeaCoordE6(lo, ew);
+      nmeaField(line, 9, fld, sizeof(fld)); gpsAltM = (float)atof(fld);
+      gpsFix = true; gpsPresent = true; gpsFixAt = millis();
+    } else gpsFix = false;
+  } else if (strstr(line, "RMC") == line + 3) {    // $??RMC
+    nmeaField(line, 2, fld, sizeof(fld));
+    if (fld[0] == 'A') {
+      gpsPresent = true;
+      nmeaField(line, 7, fld, sizeof(fld)); gpsSpeedKmh = (float)(atof(fld) * 1.852);
+      if (!gpsTimeSet) {
+        char tv[16], dv[16];
+        nmeaField(line, 1, tv, sizeof(tv));
+        nmeaField(line, 9, dv, sizeof(dv));
+        if (strlen(tv) >= 6 && strlen(dv) >= 6) {
+          int hh = (tv[0] - '0') * 10 + tv[1] - '0', mm = (tv[2] - '0') * 10 + tv[3] - '0', ss = (tv[4] - '0') * 10 + tv[5] - '0';
+          int dd = (dv[0] - '0') * 10 + dv[1] - '0', mo = (dv[2] - '0') * 10 + dv[3] - '0', yy = 2000 + (dv[4] - '0') * 10 + dv[5] - '0';
+          int64_t ep = daysFromCivil(yy, mo, dd) * 86400 + hh * 3600 + mm * 60 + ss;
+          struct timeval now = { (time_t)ep, 0 };
+          settimeofday(&now, nullptr);
+          gpsTimeSet = true;
+        }
+      }
+    }
+  }
+}
+static void gpsPoll() {
+  static char lb[110];
+  static int ln = 0;
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+    if (c == '\n') { lb[ln] = 0; if (ln > 6) gpsHandleLine(lb); ln = 0; }
+    else if (c != '\r' && ln < (int)sizeof(lb) - 1) lb[ln++] = c;
+  }
+  if (!gpsSwapped && !gpsPresent && millis() > 20000) {
+    gpsSwapped = true;
+    Serial1.end();
+    Serial1.begin(9600, SERIAL_8N1, GPS_TX_PIN, GPS_RX_PIN);   // swapped order
+  }
+  if (gpsFix && millis() - gpsFixAt > 10000) gpsFix = false;
+}
+static void sendPosBeacon() {
+  if (!gpsFix) { termPush("GPS", "no fix yet"); return; }
+  char tb[44];
+  snprintf(tb, sizeof(tb), "%ld,%ld,%d", (long)gpsLatE6, (long)gpsLonE6, (int)lroundf(gpsAltM));
+  if (chatOn) {
+    MsgPacket m; memset(&m, 0, sizeof(m));
+    m.type = 4;
+    { String nm = u8cut(myName, 15); strncpy(m.name, nm.c_str(), 15); }
+    strncpy(m.text, tb, sizeof(m.text) - 1);
+    esp_now_send(BCAST_MAC, (uint8_t*)&m, sizeof(m));
+  }
+  loraSendFrame(3, String(tb));
+  lastBeaconAt = millis();
+  termPush("GPS", String("POS ") + tb);
+  if (screen == SC_GPS) needsRedraw = true;
+}
+static void distBrg(int32_t la1, int32_t lo1, int32_t la2, int32_t lo2, float* dm, float* brg) {
+  float dLa = (la2 - la1) * 1e-6f, dLo = (lo2 - lo1) * 1e-6f;
+  float mLa = (la1 + la2) * 0.5e-6f * 0.01745329f;
+  float x = dLo * 0.01745329f * cosf(mLa) * 6371000.0f;
+  float y = dLa * 0.01745329f * 6371000.0f;
+  *dm = sqrtf(x * x + y * y);
+  float b = atan2f(x, y) * 57.29578f;
+  if (b < 0) b += 360.0f;
+  *brg = b;
+}
+static const char* compass8(float b) {
+  static const char* D[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+  return D[((int)((b + 22.5f) / 45.0f)) % 8];
+}
+static void drawGps() {
+  Lcd.fillScreen(UI_BG);
+  drawHeader("GPS");
+  if (!gpsPresent) {
+    txt("No GPS data.", 12, 44, UI_WARN, 1);
+    txt("Onboard GPS is a T-Deck Plus feature;", 12, 74, UI_DIM, 1);
+    txt("on the Plus it needs a view of the sky.", 12, 90, UI_DIM, 1);
+    txt("RX/TX auto-swap is tried at 20 s.", 12, 116, UI_MUTE, 1);
+    return;
+  }
+  char b[56];
+  if (gpsFix) {
+    snprintf(b, sizeof(b), "LAT %ld.%06ld", (long)(gpsLatE6 / 1000000), (long)labs(gpsLatE6 % 1000000));
+    txt(b, 12, 40, UI_TEXT, 1);
+    snprintf(b, sizeof(b), "LON %ld.%06ld", (long)(gpsLonE6 / 1000000), (long)labs(gpsLonE6 % 1000000));
+    txt(b, 12, 58, UI_TEXT, 1);
+    snprintf(b, sizeof(b), "ALT %.0f m   SAT %d   %.0f km/h", gpsAltM, gpsSats, gpsSpeedKmh);
+    txt(b, 12, 76, UI_DIM, 1);
+    txt(gpsTimeSet ? "Clock set from GPS" : "Clock: waiting for RMC", 12, 94, UI_MUTE, 1);
+    if (lastBeaconAt) {
+      snprintf(b, sizeof(b), "Last beacon %lus ago", (millis() - lastBeaconAt) / 1000);
+      txt(b, 12, 112, UI_MUTE, 1);
+    }
+    hbtn(60, 180, 200, 44, "SEND POS", KC_ACT, UI_TEXT);
+  } else {
+    snprintf(b, sizeof(b), "Searching... SAT %d", gpsSats);
+    txt(b, 12, 40, UI_TEXT, 1);
+    txt("A fix can take a minute under open sky.", 12, 66, UI_DIM, 1);
+  }
+}
+
+// ============================================================
+//  MAP (cached GSI tiles) -- tiles live on SD as JPG:
+//  /maps/<z>/<x>/<y>.jpg (converted from the GSI standard
+//  tiles on a PC; see tools/gsi_cache.py in the repo).
+//  Source: Geospatial Information Authority of Japan.
+//  No tiles for an area = honest dark placeholder squares.
+// ============================================================
+static int32_t mapLatE6 = 35681000, mapLonE6 = 139691700;   // Tokyo fallback
+static int mapZ = 15;
+static bool mapCenterSet = false;
+static void loadMapPrefs() {
+  prefs.begin("map", true);
+  mapLatE6 = prefs.getInt("lat", mapLatE6);
+  mapLonE6 = prefs.getInt("lon", mapLonE6);
+  mapZ = prefs.getInt("z", 15);
+  prefs.end();
+  if (mapZ < 5 || mapZ > 18) mapZ = 15;
+  mapCenterSet = true;
+}
+static void saveMapPrefs() { prefs.begin("map", false); prefs.putInt("lat", mapLatE6); prefs.putInt("lon", mapLonE6); prefs.putInt("z", mapZ); prefs.end(); }
+static void mapRecenterGps() {
+  if (gpsFix) { mapLatE6 = gpsLatE6; mapLonE6 = gpsLonE6; saveMapPrefs(); }
+}
+static void latLonToPx(double lat, double lon, int z, double* px, double* py) {
+  double n = pow(2.0, z);
+  *px = (lon + 180.0) / 360.0 * n * 256.0;
+  double r = lat * 3.141592653589793 / 180.0;
+  *py = (1.0 - log(tan(r) + 1.0 / cos(r)) / 3.141592653589793) / 2.0 * n * 256.0;
+}
+static void pxToLatLon(double px, double py, int z, int32_t* laE6, int32_t* loE6) {
+  double n = pow(2.0, z);
+  double lon = px / (n * 256.0) * 360.0 - 180.0;
+  double lat = atan(sinh(3.141592653589793 * (1.0 - 2.0 * py / (n * 256.0)))) * 180.0 / 3.141592653589793;
+  *laE6 = (int32_t)lround(lat * 1000000.0);
+  *loE6 = (int32_t)lround(lon * 1000000.0);
+}
+static void mapPan(int dxPx, int dyPx) {
+  double cpx, cpy;
+  latLonToPx(mapLatE6 * 1e-6, mapLonE6 * 1e-6, mapZ, &cpx, &cpy);
+  pxToLatLon(cpx + dxPx, cpy + dyPx, mapZ, &mapLatE6, &mapLonE6);
+}
+static void mapTapCenter(int tx, int ty) {
+  double cpx, cpy;
+  latLonToPx(mapLatE6 * 1e-6, mapLonE6 * 1e-6, mapZ, &cpx, &cpy);
+  pxToLatLon(cpx + (tx - SCR_W / 2), cpy + (ty - SCR_H / 2), mapZ, &mapLatE6, &mapLonE6);
+  saveMapPrefs();
+}
+static bool mapTjpgInit = false;
+static bool mapTjpgOut(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  Lcd.pushImage(x, y, w, h, bmp);
+  return true;
+}
+static void drawMap() {
+  if (!mapTjpgInit) { mapTjpgInit = true; Lcd.setSwapBytes(true); TJpgDec.setJpgScale(1); TJpgDec.setCallback(mapTjpgOut); }
+  double cpx, cpy;
+  latLonToPx(mapLatE6 * 1e-6, mapLonE6 * 1e-6, mapZ, &cpx, &cpy);
+  int tlx = (int)lround(cpx) - SCR_W / 2, tly = (int)lround(cpy) - SCR_H / 2;
+  int tx0 = tlx / 256, ty0 = tly / 256;
+  if (tlx < 0) tx0--;
+  if (tly < 0) ty0--;
+  Lcd.fillScreen(UI_BG);
+  for (int tyi = ty0; tyi * 256 < tly + SCR_H; tyi++) {
+    for (int txi = tx0; txi * 256 < tlx + SCR_W; txi++) {
+      int sx = txi * 256 - tlx, sy = tyi * 256 - tly;
+      char path[40];
+      snprintf(path, sizeof(path), "/maps/%d/%d/%d.jpg", mapZ, txi, tyi);
+      bool drawn = false;
+      if (sdReady && SD.exists(path)) drawn = TJpgDec.drawSdJpg(sx, sy, path) == JDR_OK;
+      if (!drawn) {
+        Lcd.fillRect(sx, sy, 256, 256, UI_GHOST);
+        Lcd.drawRect(sx, sy, 256, 256, UI_BORDER);
+      }
+    }
+  }
+  auto marker = [&](int32_t la, int32_t lo, uint16_t col, const char* tag) {
+    double px, py;
+    latLonToPx(la * 1e-6, lo * 1e-6, mapZ, &px, &py);
+    int mx = (int)lround(px) - tlx, my = (int)lround(py) - tly;
+    if (mx < -8 || my < -8 || mx > SCR_W + 8 || my > SCR_H + 8) return;
+    Lcd.fillCircle(mx, my, 5, col);
+    Lcd.drawCircle(mx, my, 7, col);
+    if (tag) txt(tag, mx + 9, my - 4, col, 1);
+  };
+  for (int i = 0; i < chatPeerCount; i++)
+    if (chatPeers[i].posAt && millis() - chatPeers[i].posAt < 1800000UL)
+      marker(chatPeers[i].latE6, chatPeers[i].lonE6, UI_WARN, peerName(i).substring(0, 4).c_str());
+  if (gpsFix) marker(gpsLatE6, gpsLonE6, UI_ACCENT, "ME");
+  Lcd.fillRect(0, 0, 44, 20, UI_BG);
+  Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(2); Lcd.setTextColor(UI_DIM, UI_BG);
+  Lcd.setTextDatum(lgfx::textdatum_t::top_left);
+  Lcd.drawString("<", 4, 0);
+  Lcd.fillRect(0, SCR_H - 16, SCR_W, 16, UI_BG);
+  char hb[64];
+  snprintf(hb, sizeof(hb), "Z%d  %ld.%04ld,%ld.%04ld  GSI tiles", mapZ,
+           (long)(mapLatE6 / 1000000), (long)labs((mapLatE6 % 1000000) / 100),
+           (long)(mapLonE6 / 1000000), (long)labs((mapLonE6 % 1000000) / 100));
+  txt(hb, 4, SCR_H - 14, UI_MUTE, 1);
+  hbtn(162, 196, 70, 26, "-", KC_NORMAL, UI_TEXT);
+  hbtn(240, 196, 70, 26, "+", KC_NORMAL, UI_TEXT);
+}
+
 
 // ============================================================
 //  SCREENS
 // ============================================================
 static int brightnessVal = 200;
-static const char* WD[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-static void nowTm(struct tm& t) { time_t tt = time(nullptr); localtime_r(&tt, &t); }
-static bool timeIsSet() { struct tm t; nowTm(t); return (t.tm_year + 1900) >= 2025; }
 static int batteryPct() {
   int raw = analogRead(PIN_BAT_ADC);
   float v = raw / 4095.0f * 3.3f * 2.0f;
   int pct = (int)((v - 3.3f) / (4.2f - 3.3f) * 100.0f);
   return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
 }
-// ---- 7-segment time (same renderer as the M5 build) ----
-static void segH(int x, int y, int len, int t, uint16_t c) {
-  Lcd.fillRect(x + t / 2, y, len - t, t, c);
-  Lcd.fillTriangle(x, y + t / 2, x + t / 2, y, x + t / 2, y + t, c);
-  Lcd.fillTriangle(x + len, y + t / 2, x + len - t / 2, y, x + len - t / 2, y + t, c);
-}
-static void segV(int x, int y, int len, int t, uint16_t c) {
-  Lcd.fillRect(x, y + t / 2, t, len - t, c);
-  Lcd.fillTriangle(x + t / 2, y, x, y + t / 2, x + t, y + t / 2, c);
-  Lcd.fillTriangle(x + t / 2, y + len, x, y + len - t / 2, x + t, y + len - t / 2, c);
-}
-static void segDigit(int x, int y, int w, int h, int d) {
-  static const uint8_t SEGMAP[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
-  uint8_t m = (d >= 0 && d <= 9) ? SEGMAP[d] : 0x40;   // out of range = dash
-  uint16_t off = Lcd.color565(7, 22, 12);
-  const int t = 6;
-  auto one = [&](int bit, uint16_t c) {
-    switch (bit) {
-      case 0: segH(x + 1, y, w - 2, t, c); break;
-      case 1: segV(x + w - t, y + 1, h / 2 - 1, t, c); break;
-      case 2: segV(x + w - t, y + h / 2, h / 2 - 1, t, c); break;
-      case 3: segH(x + 1, y + h - t, w - 2, t, c); break;
-      case 4: segV(x, y + h / 2, h / 2 - 1, t, c); break;
-      case 5: segV(x, y + 1, h / 2 - 1, t, c); break;
-      case 6: segH(x + 1, y + (h - t) / 2, w - 2, t, c); break;
-    }
-  };
-  for (int b = 0; b < 7; b++) one(b, off);                          // ghost underlay first
-  for (int b = 0; b < 7; b++) if ((m >> b) & 1) one(b, UI_ACCENT);  // lit segments on top
-}
-#define SEG_X0 8
-#define SEG_Y0 52
-static void drawSevenSegTime(int hh, int mm) {
-  const int w = 24, h = 38;
-  segDigit(SEG_X0, SEG_Y0, w, h, hh / 10);
-  segDigit(SEG_X0 + 30, SEG_Y0, w, h, hh % 10);
-  Lcd.fillRect(SEG_X0 + 60, SEG_Y0 + 9, 6, 6, UI_ACCENT);
-  Lcd.fillRect(SEG_X0 + 60, SEG_Y0 + 25, 6, 6, UI_ACCENT);
-  segDigit(SEG_X0 + 70, SEG_Y0, w, h, mm / 10);
-  segDigit(SEG_X0 + 100, SEG_Y0, w, h, mm % 10);
-}
 // ---- home terminal stream (group conversation, both radios) ----
-#define TERM_N 6
+#define TERM_N 10
 static String termLines[TERM_N];
 static int termCount = 0;
 static bool termDirty = true;
@@ -1263,77 +1418,40 @@ static void termInitFromLog() {
   }
   f.close();
 }
-// ---- home screen ----
-static int lastSec = -1, lastMin = -1, lastDay = -1;
-static unsigned long lastSensorDraw = 0;
-static String lastHomeStatus = "\x01";
-static void drawHomeDateTime() {
-  struct tm t; nowTm(t);
-  Lcd.fillRect(0, 17, 190, 75, UI_BG);
-  char db[40];
-  if (timeIsSet()) snprintf(db, sizeof(db), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-  else snprintf(db, sizeof(db), "----/--/--");
-  Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(2); Lcd.setTextColor(UI_TEXT, UI_BG);
-  Lcd.setTextDatum(lgfx::textdatum_t::top_left);
-  Lcd.drawString(db, 8, 18);
-  if (timeIsSet()) drawSevenSegTime(t.tm_hour, t.tm_min);
-  else drawSevenSegTime(-1, -1);
-  char sb[12]; snprintf(sb, sizeof(sb), "%s %02d", WD[t.tm_wday % 7], t.tm_sec);
-  Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(1); Lcd.setTextColor(UI_DIM, UI_BG);
-  Lcd.drawString(sb, 140, 68);
-}
-static void drawHomeSeconds() {
-  struct tm t; nowTm(t);
-  Lcd.fillRect(136, 64, 84, 20, UI_BG);
-  char sb[12]; snprintf(sb, sizeof(sb), "%s %02d", WD[t.tm_wday % 7], t.tm_sec);
+// ---- home screen: slim header (name / quiet GPS clock / battery),
+// radio status card, and the group terminal filling the rest ----
+static unsigned long lastStatusDraw = 0;
+static int hdrMinShown = -2;
+static void drawHomeClock() {
+  Lcd.fillRect(178, 0, 76, 16, UI_BG);
+  time_t tt = time(nullptr);
+  if (tt <= 1700000000 && !gpsPresent) return;   // no clock source on this unit: leave the corner empty
+  char cb[8];
+  if (tt > 1700000000) { struct tm t; localtime_r(&tt, &t); snprintf(cb, sizeof(cb), "%02d:%02d", t.tm_hour, t.tm_min); }
+  else snprintf(cb, sizeof(cb), "--:--");
   Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(1); Lcd.setTextColor(UI_DIM, UI_BG);
   Lcd.setTextDatum(lgfx::textdatum_t::top_left);
-  Lcd.drawString(sb, 140, 68);
+  Lcd.drawString(cb, 196, 1);
 }
-static void drawHomeCard() {
-  Lcd.fillRect(9, 95, SCR_W - 18, 46, UI_CARD);
-  if (sensorsPresent()) {
-    char b1[48], b2[48];
-    if (!isnan(senT)) snprintf(b1, sizeof(b1), "IN  %.1fC   %.0f%%", senT, senH); else snprintf(b1, sizeof(b1), "IN  --.-C   --%%");
-    txt(b1, 16, 100, UI_TEXT, 1);
-    if (!isnan(senP)) {
-      float trend = prCount >= 2 ? senP - prAt(0) : 0;
-      snprintf(b2, sizeof(b2), "%.1f hPa  %s", senP, trend > 0.3f ? "RISING" : (trend < -0.3f ? "FALLING" : "STEADY"));
-    } else snprintf(b2, sizeof(b2), "-- hPa");
-    txt(b2, 16, 118, UI_DIM, 1);
-    if (prCount >= 2) {   // always-on mini graph, right half of the card
-      float mn = prAt(0), mx = prAt(0);
-      for (int i = 0; i < prCount; i++) { float v = prAt(i); if (v < mn) mn = v; if (v > mx) mx = v; }
-      if (mx - mn < 1.0f) { mx += 0.5f; mn -= 0.5f; }
-      int gx = 196, gw = 108, gy = 98, gh = 40;
-      Lcd.drawRect(gx - 2, gy - 2, gw + 4, gh + 4, UI_BORDER);
-      int prevX = -1, prevY = -1;
-      for (int i = 0; i < prCount; i++) {
-        int x = gx + i * (gw - 1) / (prCount - 1);
-        int y = gy + gh - 1 - (int)((prAt(i) - mn) / (mx - mn) * (gh - 1));
-        if (prevX >= 0) Lcd.drawLine(prevX, prevY, x, y, UI_ACCENT);
-        prevX = x; prevY = y;
-      }
-    }
-  } else {
-    char b1[64], b2[64];
-    snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "");
-    txt(b1, 16, 100, UI_TEXT, 1);
-    if (loraReady) {
-      if (loraProf == 2) snprintf(b2, sizeof(b2), "LoRa 920.8 MESHCR  RX %lu pkts", rawTotal);
-      else if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 920.8 %s  %s  %ddBm", loraProf ? "NARROW" : "STD", loraHeardName.c_str(), loraHeardRssi);
-      else snprintf(b2, sizeof(b2), "LoRa 920.8 %s  listening", loraProf ? "NARROW" : "STD");
-    } else snprintf(b2, sizeof(b2), "LoRa -- (not found)");
-    txt(b2, 16, 118, UI_DIM, 1);
-  }
+static void drawHomeStatus() {
+  Lcd.fillRect(9, 59, SCR_W - 18, 30, UI_CARD);
+  char b1[64], b2[64];
+  snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "");
+  txt(b1, 16, 61, UI_TEXT, 1);
+  if (loraReady) {
+    if (loraProf == 2) snprintf(b2, sizeof(b2), "LoRa 920.8 MESHCR  RX %lu pkts", rawTotal);
+    else if (loraHeardAt && millis() - loraHeardAt < 3600000UL) snprintf(b2, sizeof(b2), "LoRa 920.8 %s  %s  %ddBm", loraProf ? "NARROW" : "STD", loraHeardName.c_str(), loraHeardRssi);
+    else snprintf(b2, sizeof(b2), "LoRa 920.8 %s  listening", loraProf ? "NARROW" : "STD");
+  } else snprintf(b2, sizeof(b2), "LoRa -- (not found)");
+  txt(b2, 16, 77, UI_DIM, 1);
 }
 static void drawHomeTerminal() {
-  Lcd.fillRect(9, 169, SCR_W - 18, 50, UI_BG);
-  if (termScroll > termCount - 2) termScroll = termCount > 2 ? termCount - 2 : 0;
+  Lcd.fillRect(9, 114, SCR_W - 18, 96, UI_BG);
+  if (termScroll > termCount - 5) termScroll = termCount > 5 ? termCount - 5 : 0;
   if (termScroll < 0) termScroll = 0;
   int showTo = termCount - termScroll;
-  int start = showTo - 2; if (start < 0) start = 0;
-  int y = 170;
+  int start = showTo - 5; if (start < 0) start = 0;
+  int y = 116;
   for (int i = start; i < showTo; i++) {
     int bar = termLines[i].indexOf('|');
     String who = bar >= 0 ? termLines[i].substring(0, bar) : "?";
@@ -1343,39 +1461,33 @@ static void drawHomeTerminal() {
     jpText(fitText(ln, SCR_W - 26).c_str(), 12, y, mine ? UI_ACCENT : UI_TEXT, -1);
     y += 18;
   }
-  drawComposerLine(12, 202, UI_ACCENT);
+  drawComposerLine(12, 216, UI_ACCENT);
   termDirty = false;
 }
 static void drawHome() {
   Lcd.fillScreen(UI_BG);
-  // top-right: name + battery
   char bb[24]; snprintf(bb, sizeof(bb), "BAT %d%%", batteryPct());
   txt(bb, SCR_W - 6 - txtW(bb), 1, UI_MUTE, 1);
   txt(fitText(myName, 150).c_str(), 8, 1, UI_MUTE, 1);
-  hbtn(196, 26, 38, 34, "CHAT", KC_ACT, UI_TEXT);
-  if (anyUnread()) Lcd.fillCircle(230, 30, 4, UI_WARN);
-  hbtn(238, 26, 38, 34, "MUS", KC_NORMAL, UI_TEXT);
-  hbtn(280, 26, 34, 34, "SET", KC_NORMAL, UI_TEXT);
-  card(8, 94, SCR_W - 16, 48);
-  card(8, 150, SCR_W - 16, 70);
-  txt(chatOn ? "COMIC CHAT" : "COMIC CHAT (off)", 14, 152, UI_MUTE, 1);
-  lastMin = -1; lastDay = -1; lastSensorDraw = 0;
-  drawHomeDateTime();
-  struct tm t; nowTm(t);
-  lastMin = t.tm_min; lastDay = t.tm_mday; lastSec = t.tm_sec;
-  drawHomeCard();
+  hdrMinShown = -2;
+  drawHomeClock();
+  hbtn(6, 20, 74, 30, "CHAT", KC_ACT, UI_TEXT);
+  if (anyUnread()) Lcd.fillCircle(76, 24, 4, UI_WARN);
+  hbtn(84, 20, 74, 30, "MAP", KC_NORMAL, UI_TEXT);
+  hbtn(162, 20, 74, 30, "FM", KC_NORMAL, UI_TEXT);
+  hbtn(240, 20, 74, 30, "SET", KC_NORMAL, UI_TEXT);
+  card(8, 56, SCR_W - 16, 36);
+  card(8, 96, SCR_W - 16, 140);
+  txt(chatOn ? "COMIC CHAT" : "COMIC CHAT (off)", 14, 100, UI_MUTE, 1);
+  lastStatusDraw = 0;
+  drawHomeStatus();
   drawHomeTerminal();
 }
 static void homeTick() {
-  struct tm t; nowTm(t);
-  if (t.tm_mday != lastDay || t.tm_min != lastMin) {
-    drawHomeDateTime();
-    lastDay = t.tm_mday; lastMin = t.tm_min; lastSec = t.tm_sec;
-  } else if (t.tm_sec != lastSec) {
-    drawHomeSeconds();
-    lastSec = t.tm_sec;
-  }
-  if (millis() - lastSensorDraw > 5000) { lastSensorDraw = millis(); drawHomeCard(); }
+  time_t tt = time(nullptr);
+  int mn = tt > 1700000000 ? (int)(tt / 60) : -1;
+  if (mn != hdrMinShown) { hdrMinShown = mn; drawHomeClock(); }
+  if (millis() - lastStatusDraw > 5000) { lastStatusDraw = millis(); drawHomeStatus(); }
   if (termDirty) drawHomeTerminal();
 }
 // ---- chat screen ----
@@ -1423,6 +1535,16 @@ static void drawPeers() {
     bool on = !macIsZero(chatPeers[i].mac) && chatPeers[i].lastSeen && millis() - chatPeers[i].lastSeen < PEER_TIMEOUT_MS;
     if (i == peerSel) Lcd.fillRoundRect(4, y - 2, SCR_W - 8, 20, 4, KC_ACT);
     String ln = peerName(i) + (macIsZero(chatPeers[i].mac) ? " [ALL]" : (on ? " [ON]" : " [--]")) + (chatPeers[i].hasUnread ? " [NEW]" : "");
+    if (chatPeers[i].posAt && millis() - chatPeers[i].posAt < 1800000UL) {
+      if (gpsFix) {
+        float dm, br;
+        distBrg(gpsLatE6, gpsLonE6, chatPeers[i].latE6, chatPeers[i].lonE6, &dm, &br);
+        char pb[24];
+        if (dm >= 1000.0f) snprintf(pb, sizeof(pb), "  %.1fkm %s", dm / 1000.0f, compass8(br));
+        else snprintf(pb, sizeof(pb), "  %.0fm %s", dm, compass8(br));
+        ln += pb;
+      } else ln += "  [POS]";
+    }
     jpText(fitText(ln, SCR_W - 24).c_str(), 10, y, UI_TEXT, -1);
     y += 22;
   }
@@ -1466,60 +1588,8 @@ static void drawRaw() {
   }
   txt("ESC / tap top-left: back to peers", 10, 224, UI_MUTE, 1);
 }
-// ---- music screens (same layout language as the M5 build) ----
-static void drawMusicScreen() {
-  Lcd.fillScreen(UI_BG);
-  drawHeader("MUSIC");
-  card(6, 26, SCR_W - 12, 64);
-  if (musicCur >= 0) {
-    jpText(fitText(trackTitle((int)musicCur), SCR_W - 28).c_str(), 14, 32, UI_TEXT, -1);
-    unsigned long el = musicElapsedSec();
-    char eb[24]; snprintf(eb, sizeof(eb), "%s  %lu:%02lu", musicPaused ? "PAUSE" : (musicPlaying ? "PLAY" : "STOP"), el / 60, el % 60);
-    txt(eb, 14, 58, UI_DIM, 1);
-    Lcd.drawRect(120, 62, 180, 8, UI_BORDER);
-    Lcd.fillRect(121, 63, (int)(178 * musicProgress()), 6, UI_ACCENT);
-  } else {
-    txt("No track selected", 14, 44, UI_MUTE, 1);
-  }
-  hbtn(6, 96, 98, 44, "|<<", KC_NORMAL, UI_TEXT);
-  hbtn(111, 96, 98, 44, musicPlaying && !musicPaused ? "||" : ">", KC_ACT, UI_TEXT);
-  hbtn(216, 96, 98, 44, ">>|", KC_NORMAL, UI_TEXT);
-  txt("VOL", 10, 157, UI_DIM, 1);
-  hbtn(48, 148, 48, 34, "-", KC_NORMAL, UI_TEXT);
-  Lcd.drawRect(108, 158, 132, 12, UI_BORDER);
-  Lcd.fillRect(109, 159, (int)(130 * musicVol / 255.0f), 10, UI_ACCENT2);
-  hbtn(252, 148, 48, 34, "+", KC_NORMAL, UI_TEXT);
-  hbtn(6, 192, 308, 40, "TRACKS >", KC_NORMAL, UI_TEXT);
-}
-static void updateMusicScreen() {
-  if (musicCur < 0) return;
-  Lcd.fillRect(12, 56, 106, 18, UI_CARD);
-  unsigned long el = musicElapsedSec();
-  char eb[24]; snprintf(eb, sizeof(eb), "%s  %lu:%02lu", musicPaused ? "PAUSE" : (musicPlaying ? "PLAY" : "STOP"), el / 60, el % 60);
-  txt(eb, 14, 58, UI_DIM, 1);
-  Lcd.drawRect(120, 62, 180, 8, UI_BORDER);
-  Lcd.fillRect(121, 63, 178, 6, UI_CARD);
-  Lcd.fillRect(121, 63, (int)(178 * musicProgress()), 6, UI_ACCENT);
-}
-static int tracksTop = 0, trackSel = 0;
-static void drawTracks() {
-  Lcd.fillScreen(UI_BG);
-  drawHeader("TRACKS");
-  if (musicCount == 0) txt(sdReady ? "No .mp3/.wav in /music" : "No SD card", 10, 44, UI_MUTE, 1);
-  for (int r = 0; r < 4; r++) {
-    int idx = tracksTop + r;
-    if (idx >= musicCount) break;
-    int y = 34 + r * 42;
-    Lcd.fillRoundRect(6, y, SCR_W - 12, 38, 6, idx == musicCur ? KC_ACT : UI_CARD);
-    Lcd.drawRoundRect(6, y, SCR_W - 12, 38, 6, idx == trackSel ? UI_ACCENT : UI_BORDER);
-    String line = String(idx == musicCur && musicPlaying ? "> " : "  ") + trackTitle(idx);
-    jpText(fitText(line, SCR_W - 44).c_str(), 14, y + 11, idx == musicCur ? UI_ACCENT : UI_TEXT, -1);
-  }
-  if (tracksTop > 0) hbtn(6, 208, 150, 28, "^ PAGE", KC_NORMAL, UI_TEXT);
-  if (tracksTop + 4 < musicCount) hbtn(164, 208, 150, 28, "PAGE v", KC_NORMAL, UI_TEXT);
-}
 // ---- settings ----
-static bool editingName = false, editingAlt = false;
+static bool editingName = false;
 static String editBuf = "";
 static void drawSettings() {
   Lcd.fillScreen(UI_BG);
@@ -1537,44 +1607,9 @@ static void drawSettings() {
   row("ESP-NOW", chatOn ? "ON" : "OFF");
   row("ESP-NOW Ch", String(chatChannel));
   row("ESP-NOW", chatLR ? "LongRange" : "Normal");
-  if (editingAlt) row("Altitude*", editBuf + "_");
-  else row("Altitude", String(pressAltM) + " m");
-  {
-    struct tm t; nowTm(t);
-    char cb[32];
-    snprintf(cb, sizeof(cb), "%04d-%02d-%02d %02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
-    row("Clock", cb);
-  }
   row("Bright", String(brightnessVal));
   row("Cursor", cursorMode == 0 ? "Auto" : (cursorMode == 1 ? "ON" : "OFF"));
   row("LoRa", loraProf == 1 ? "Narrow" : (loraProf == 2 ? "MeshCore" : "Std"));
-}
-// ---- time set ----
-static int tsF[6] = {2026, 1, 1, 0, 0, 0};
-static void drawTimeSet() {
-  Lcd.fillScreen(UI_BG);
-  drawHeader("Set clock");
-  const char* LB[6] = {"Year", "Month", "Day", "Hour", "Min", "Sec"};
-  for (int i = 0; i < 6; i++) {
-    int y = 32 + i * 30;
-    txt(LB[i], 16, y + 5, UI_DIM, 1);
-    hbtn(120, y, 36, 24, "-", KC_NORMAL, UI_TEXT);
-    char vb[12]; snprintf(vb, sizeof(vb), "%d", tsF[i]);
-    Lcd.setFont(&lgfx::fonts::Font2); Lcd.setTextSize(1); Lcd.setTextColor(UI_TEXT);
-    Lcd.setTextDatum(lgfx::textdatum_t::middle_center);
-    Lcd.drawString(vb, 196, y + 12);
-    Lcd.setTextDatum(lgfx::textdatum_t::top_left);
-    hbtn(236, y, 36, 24, "+", KC_NORMAL, UI_TEXT);
-  }
-  hbtn(96, 216, 128, 22, "SET TIME", KC_ACT, UI_TEXT);
-}
-static void applyTimeSet() {
-  struct tm t = {};
-  t.tm_year = tsF[0] - 1900; t.tm_mon = tsF[1] - 1; t.tm_mday = tsF[2];
-  t.tm_hour = tsF[3]; t.tm_min = tsF[4]; t.tm_sec = tsF[5];
-  time_t tt = mktime(&t);
-  struct timeval tv = {tt, 0};
-  settimeofday(&tv, nullptr);
 }
 static void drawCurrent() {
   switch (screen) {
@@ -1582,10 +1617,10 @@ static void drawCurrent() {
     case SC_CHAT: drawChat(); break;
     case SC_PEERS: drawPeers(); break;
     case SC_RAW: drawRaw(); break;
-    case SC_MUSIC: drawMusicScreen(); break;
-    case SC_TRACKS: drawTracks(); break;
     case SC_SET: drawSettings(); break;
-    case SC_TIMESET: drawTimeSet(); break;
+    case SC_RADIO: drawRadio(); break;
+    case SC_GPS: drawGps(); break;
+    case SC_MAP: drawMap(); break;
   }
 }
 static void goHome() { screen = SC_HOME; needsRedraw = true; }
@@ -1612,16 +1647,15 @@ static void doSend(const String& text) {
 }
 // ---- keyboard routing ----
 static void handleKey(int c) {
-  if (editingName || editingAlt) {
+  if (editingName) {
     if (c == 0x0D) {
-      if (editingName) { if (editBuf.length()) { myName = editBuf; saveMyName(); } editingName = false; }
-      if (editingAlt) { pressAltM = editBuf.toInt(); prefs.begin("wx", false); prefs.putInt("alt", pressAltM); prefs.end(); editingAlt = false; }
+      if (editBuf.length()) { myName = editBuf; saveMyName(); }
+      editingName = false;
       needsRedraw = true;
-    } else if (c == 0x1B) { editingName = editingAlt = false; needsRedraw = true; }
+    } else if (c == 0x1B) { editingName = false; needsRedraw = true; }
     else if (c == 0x08) { if (editBuf.length()) editBuf.remove(editBuf.length() - 1); needsRedraw = true; }
     else if (c >= 0x20 && c < 0x7F) {
-      if (editingName && editBuf.length() < 15) editBuf += (char)c;
-      if (editingAlt && editBuf.length() < 6 && (isdigit(c) || c == '-')) editBuf += (char)c;
+      if (editBuf.length() < 15) editBuf += (char)c;
       needsRedraw = true;
     }
     return;
@@ -1645,16 +1679,6 @@ static void handleKey(int c) {
       else if (c == 0x1B) { if (screen == SC_CHAT) goHome(); else inputBuf = ""; needsRedraw = true; termDirty = true; }
       else if (c >= 0x20 && c < 0x7F && inputBuf.length() < 180) { inputBuf += (char)c; needsRedraw = true; termDirty = true; }
       break;
-    case SC_MUSIC:
-      if (c == ' ') { musicTogglePause(); needsRedraw = true; }
-      else if (c == 'n') musicNext();
-      else if (c == 'p') musicPrev();
-      else if (c == 0x1B) goHome();
-      break;
-    case SC_TRACKS:
-      if (c == 0x0D) { musicPlay(trackSel); screen = SC_MUSIC; needsRedraw = true; }
-      else if (c == 0x1B) { screen = SC_MUSIC; needsRedraw = true; }
-      break;
     case SC_PEERS:
       if (c == 0x0D && peerSel >= 0 && peerSel < chatPeerCount) {
         curPeer = peerSel;
@@ -1663,6 +1687,9 @@ static void handleKey(int c) {
         screen = SC_CHAT;
         needsRedraw = true;
       } else if (c == 'r' || c == 'R') { screen = SC_RAW; needsRedraw = true; }
+      else if (c == 'f' || c == 'F') { screen = SC_RADIO; needsRedraw = true; }
+      else if (c == 'g' || c == 'G') { screen = SC_GPS; needsRedraw = true; }
+      else if (c == 'm' || c == 'M') { mapRecenterGps(); screen = SC_MAP; needsRedraw = true; }
       else if (c == 0x1B) goHome();
       break;
     case SC_RAW:
@@ -1671,8 +1698,22 @@ static void handleKey(int c) {
     case SC_SET:
       if (c == 0x1B) goHome();
       break;
-    case SC_TIMESET:
-      if (c == 0x1B) { screen = SC_SET; needsRedraw = true; }
+    case SC_RADIO:
+      if (c == ',') { fmSeek(false); needsRedraw = true; }
+      else if (c == '.') { fmSeek(true); needsRedraw = true; }
+      else if (c == '-') { fmVolSet(fmVol - 1); needsRedraw = true; }
+      else if (c == '=' || c == '+') { fmVolSet(fmVol + 1); needsRedraw = true; }
+      else if (c == 0x1B || c == 0x0D) goHome();
+      break;
+    case SC_GPS:
+      if (c == 0x0D || c == 'b' || c == 'B') { sendPosBeacon(); needsRedraw = true; }
+      else if (c == 0x1B) goHome();
+      break;
+    case SC_MAP:
+      if (c == '+' || c == '=') { if (mapZ < 18) { mapZ++; needsRedraw = true; } }
+      else if (c == '-') { if (mapZ > 5) { mapZ--; needsRedraw = true; } }
+      else if (c == 'c' || c == 'C') { mapRecenterGps(); needsRedraw = true; }
+      else if (c == 0x1B || c == 0x0D) goHome();
       break;
   }
 }
@@ -1707,11 +1748,12 @@ static void cursorShow() {
 static void handleTouch(int tx, int ty) {
   switch (screen) {
     case SC_HOME:
-      if (ty >= 26 && ty < 60) {
-        if (tx >= 196 && tx < 234) { int gi = ensureGroupPeer(); curPeer = gi; if (gi >= 0) { chatPeers[gi].hasUnread = false; loadChatLines(gi); } screen = SC_PEERS; needsRedraw = true; }
-        else if (tx >= 238 && tx < 276) { screen = SC_MUSIC; needsRedraw = true; }
-        else if (tx >= 280) { screen = SC_SET; needsRedraw = true; }
-      } else if (ty >= 150) { screen = SC_CHAT; if (curPeer < 0) { curPeer = ensureGroupPeer(); if (curPeer >= 0) loadChatLines(curPeer); } needsRedraw = true; }
+      if (ty >= 20 && ty < 50) {
+        if (tx < 80) { int gi = ensureGroupPeer(); curPeer = gi; if (gi >= 0) { chatPeers[gi].hasUnread = false; loadChatLines(gi); } screen = SC_PEERS; needsRedraw = true; }
+        else if (tx < 158) { mapRecenterGps(); screen = SC_MAP; needsRedraw = true; }
+        else if (tx < 236) { screen = SC_RADIO; needsRedraw = true; }
+        else { screen = SC_SET; needsRedraw = true; }
+      } else if (ty >= 96) { screen = SC_CHAT; if (curPeer < 0) { curPeer = ensureGroupPeer(); if (curPeer >= 0) loadChatLines(curPeer); } needsRedraw = true; }
       break;
     case SC_CHAT:
       if (ty < 24 && tx < 50) goHome();
@@ -1737,81 +1779,52 @@ static void handleTouch(int tx, int ty) {
     case SC_RAW:
       if (ty < 24 && tx < 50) { screen = SC_PEERS; needsRedraw = true; }
       break;
-    case SC_MUSIC:
+    case SC_RADIO:
       if (ty < 24 && tx < 50) { goHome(); break; }
-      if (ty >= 96 && ty < 140) {
-        if (tx < 108) musicPrev();
-        else if (tx < 213) musicTogglePause();
-        else musicNext();
-        needsRedraw = true;
-      } else if (ty >= 148 && ty < 182) {
-        if (tx >= 48 && tx < 96) { musicVol = max(0, musicVol - 16); saveMusicVol(); applyGain(); needsRedraw = true; }
-        else if (tx >= 252 && tx < 300) { musicVol = min(255, musicVol + 16); saveMusicVol(); applyGain(); needsRedraw = true; }
-      } else if (ty >= 192) { screen = SC_TRACKS; trackSel = musicCur >= 0 ? (int)musicCur : 0; tracksTop = trackSel >= 4 ? trackSel - 3 : 0; needsRedraw = true; }
+      if (ty >= 186 && ty < 226) {
+        if (tx < 76) { fmSeek(false); needsRedraw = true; }
+        else if (tx < 154) { fmSeek(true); needsRedraw = true; }
+        else if (tx < 232) { fmVolSet(fmVol - 1); needsRedraw = true; }
+        else { fmVolSet(fmVol + 1); needsRedraw = true; }
+      }
       break;
-    case SC_TRACKS:
-      if (ty < 24 && tx < 50) { screen = SC_MUSIC; needsRedraw = true; break; }
-      if (ty >= 208) {
-        if (tx < 160 && tracksTop > 0) { tracksTop = max(0, tracksTop - 4); needsRedraw = true; }
-        else if (tx >= 160 && tracksTop + 4 < musicCount) { tracksTop += 4; needsRedraw = true; }
-        break;
-      }
-      if (ty >= 34) {
-        int off = ty - 34, r = off / 42;
-        if (r >= 0 && r < 4 && (off % 42) < 38) {
-          int idx = tracksTop + r;
-          if (idx < musicCount) { trackSel = idx; musicPlay(idx); screen = SC_MUSIC; needsRedraw = true; }
-        }
-      }
+    case SC_GPS:
+      if (ty < 24 && tx < 50) { goHome(); break; }
+      if (ty >= 180 && ty < 224) { sendPosBeacon(); needsRedraw = true; }
+      break;
+    case SC_MAP:
+      if (ty < 24 && tx < 50) { goHome(); break; }
+      if (ty >= 196 && tx >= 236) { if (mapZ < 18) mapZ++; needsRedraw = true; break; }
+      if (ty >= 196 && tx >= 158 && tx < 236) { if (mapZ > 5) mapZ--; needsRedraw = true; break; }
+      mapTapCenter(tx, ty);
+      needsRedraw = true;
       break;
     case SC_SET: {
-      if (editingName || editingAlt) {
-        int er = editingName ? 0 : 4;
-        if (ty >= 28 && (ty - 28) / 22 == er) { editingName = editingAlt = false; needsRedraw = true; }
+      if (editingName) {
+        if (ty >= 28 && (ty - 28) / 22 == 0) { editingName = false; needsRedraw = true; }
         break;
       }
       if (ty < 24 && tx < 50) { goHome(); break; }
       int rowIdx = (ty - 28) / 22;
-      if (ty >= 28 && rowIdx >= 0 && rowIdx < 9) {
-        if (rowIdx == 0) { editingName = true; editingAlt = false; editBuf = myName; }
+      if (ty >= 28 && rowIdx >= 0 && rowIdx < 7) {
+        if (rowIdx == 0) { editingName = true; editBuf = myName; }
         else if (rowIdx == 1) { if (chatOn) chatStop(); else chatStart(); }
         else if (rowIdx == 2) { chatChannel = chatChannel % 13 + 1; saveChatPrefs(); if (chatOn) { chatStop(); chatStart(); } }
         else if (rowIdx == 3) { chatLR = !chatLR; saveChatPrefs(); if (chatOn) applyChatProtocol(); }
-        else if (rowIdx == 4) { editingAlt = true; editingName = false; editBuf = String(pressAltM); }
-        else if (rowIdx == 5) {
-          struct tm t; nowTm(t);
-          tsF[0] = t.tm_year + 1900; tsF[1] = t.tm_mon + 1; tsF[2] = t.tm_mday;
-          tsF[3] = t.tm_hour; tsF[4] = t.tm_min; tsF[5] = t.tm_sec;
-          screen = SC_TIMESET;
-        }
-        else if (rowIdx == 6) {
+        else if (rowIdx == 4) {
           brightnessVal += 40; if (brightnessVal > 255) brightnessVal = 40;
           Lcd.setBrightness((uint8_t)brightnessVal);
           prefs.begin("sys", false); prefs.putInt("bright", brightnessVal); prefs.end();
         }
-        else if (rowIdx == 7) {
+        else if (rowIdx == 5) {
           cursorMode = (cursorMode + 1) % 3;
           prefs.begin("sys", false); prefs.putInt("cur", cursorMode); prefs.end();
         }
-        else if (rowIdx == 8) {
+        else if (rowIdx == 6) {
           loraProf = (loraProf + 1) % 3;
           saveChatPrefs();
           loraInit();
         }
-        needsRedraw = true;
-      }
-      break;
-    }
-    case SC_TIMESET: {
-      if (ty < 24 && tx < 50) { screen = SC_SET; needsRedraw = true; break; }
-      if (ty >= 216) { applyTimeSet(); screen = SC_SET; needsRedraw = true; break; }
-      int i = (ty - 32) / 30;
-      if (i >= 0 && i < 6 && ((ty - 32) % 30) < 24) {
-        static const int LIM[6][2] = {{2020, 2099}, {1, 12}, {1, 31}, {0, 23}, {0, 59}, {0, 59}};
-        if (tx >= 120 && tx < 156) tsF[i]--;
-        else if (tx >= 236 && tx < 272) tsF[i]++;
-        if (tsF[i] < LIM[i][0]) tsF[i] = LIM[i][0];
-        if (tsF[i] > LIM[i][1]) tsF[i] = LIM[i][1];
         needsRedraw = true;
       }
       break;
@@ -1879,37 +1892,29 @@ void setup() {
   loadChatPrefs();
   prefs.begin("sys", true); cursorMode = prefs.getInt("cur", 0); prefs.end();
   if (cursorMode < 0 || cursorMode > 2) cursorMode = 0;
-  loadMusicVol();
   prefs.begin("sys", true); brightnessVal = prefs.getInt("bright", 200); prefs.end();
-  prefs.begin("wx", true); pressAltM = prefs.getInt("alt", 0); prefs.end();
+  loadFmPrefs();
+  loadMapPrefs();
   setenv("TZ", "JST-9", 1); tzset();
   Lcd.begin(1, (uint8_t)brightnessVal);   // official init: CS pre-deselect + rotation 1
   Lcd.invertDisplay(true);               // this panel batch needs INVON, else colours are inverted
   Lcd.fillScreen(UI_BG);
-  bootType("C:\\> BOOT  ENZ T-DECK v1.0", 12, 8, UI_ACCENT);
+  bootType("C:\\> BOOT  ENZ T-DECK v14", 12, 8, UI_ACCENT);
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
   sdReady = SD.begin(PIN_SD_CS, SPI, 20000000);
   bootLine(sdReady ? "SD card ............ OK" : "SD card ............ NONE");
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);   // keyboard + touch + sensors all share this one bus/controller
   bool jp = jpInit();
   bootLine(jp ? "Japanese font ...... OK" : "Font: ASCII only");
-  sensAHT = ahtInit();
-  bool bme = bmeInit();
-  if (sensorsPresent()) {
-    sensorsPoll();
-    prSample(true);
-    bootLine(sensBME || sensBMP ? "Sensors ............ AHT+BME OK" : "Sensors ............ AHT OK");
-  } else bootLine("Sensors ............ none (radio card)");
+  bool fm = fmInit();
+  bootLine(fm ? "FM radio ........... OK (Si4703)" : "FM radio ........... none");
+  gpsInit();
+  bootLine("GPS ................ auto (Plus)");
   loadMyName();
   chatStart();
   bootLine(chatOn ? "ESP-NOW ............ ON" : "ESP-NOW ............ FAIL");
   bool lr = loraInit();
   bootLine(lr ? "LoRa 920.8MHz ..... RX" : "LoRa ............... FAIL");
-  i2sOut = new AudioOutputI2S();
-  i2sOut->SetPinout(PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DOUT);
-  applyGain();
-  musicScan();
-  xTaskCreatePinnedToCore(musicTask, "enzdec", 8192, nullptr, 2, nullptr, 1);
   int gi = ensureGroupPeer();
   curPeer = gi;
   if (gi >= 0) loadChatLines(gi);
@@ -1963,7 +1968,7 @@ void loop() {
       lastTbMoveAt = millis();
     } else if (screen == SC_HOME && tbDy != 0) {
       int ns = termScroll + tbDy;
-      int mx = termCount > 2 ? termCount - 2 : 0;
+      int mx = termCount > 5 ? termCount - 5 : 0;
       if (ns < 0) ns = 0; if (ns > mx) ns = mx;
       if (ns != termScroll) { termScroll = ns; termDirty = true; }
     }
@@ -1975,14 +1980,9 @@ void loop() {
       needsRedraw = true;
     }
     if (!cursorActive() && screen == SC_CHAT) { chatScroll += tbDy; if (chatScroll < 0) chatScroll = 0; if (chatScroll > 20) chatScroll = 20; needsRedraw = true; }
-    else if (!cursorActive() && screen == SC_TRACKS) {
-      trackSel += tbDy;
-      if (trackSel < 0) trackSel = 0;
-      if (trackSel >= musicCount) trackSel = max(0, musicCount - 1);
-      if (trackSel < tracksTop) tracksTop = trackSel;
-      if (trackSel >= tracksTop + 4) tracksTop = trackSel - 3;
-      needsRedraw = true;
-    } else if (!cursorActive() && screen == SC_PEERS) {
+    else if (!cursorActive() && screen == SC_MAP && (tbDx != 0 || tbDy != 0)) { mapPan(tbDx * 16, tbDy * 16); needsRedraw = true; }
+    else if (!cursorActive() && screen == SC_RADIO && tbDy != 0) { fmVolSet(fmVol - tbDy); needsRedraw = true; }
+    else if (!cursorActive() && screen == SC_PEERS) {
       peerSel += tbDy;
       if (peerSel < 0) peerSel = 0;
       if (peerSel >= chatPeerCount) peerSel = max(0, chatPeerCount - 1);
@@ -1996,20 +1996,15 @@ void loop() {
     if (cursorActive()) handleTouch(curX, curY);
     else if (screen == SC_PEERS) handleKey(0x0D);
     else if (screen == SC_RAW) { screen = SC_PEERS; needsRedraw = true; }
-    else if (screen == SC_TRACKS) handleKey(0x0D);
     else if (screen == SC_HOME) { screen = SC_CHAT; needsRedraw = true; }
   }
   wasTbPress = tbp;
   processChatRx();
   loraPoll();
-  static unsigned long lastSens = 0;
-  if (millis() - lastSens > 5000) { lastSens = millis(); sensorsPoll(); prSample(); }
+  gpsPoll();
+  if (screen == SC_RADIO) fmPoll();
   if (screen == SC_HOME) { homeTick(); cursorShow(); }
   if (screen == SC_CHAT && chatDirty) { chatDirty = false; needsRedraw = true; }
-  if (screen == SC_MUSIC && musicPlaying) {
-    static unsigned long lastUi = 0;
-    if (millis() - lastUi > 500) { lastUi = millis(); updateMusicScreen(); }
-  }
   if (needsRedraw) { drawCurrent(); needsRedraw = false; cursorShow(); }
   if (curMoved && cursorActive() && (millis() - lastCurPaint >= 40 || millis() - lastTbMoveAt >= 30)) {
     drawCurrent();

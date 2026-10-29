@@ -10,7 +10,7 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
 
 | フィールド | 型 | 内容 |
 |---|---|---|
-| type | uint8 | 1 = HELLO、2 = CHAT、3 = VOICE(予約・未実装) |
+| type | uint8 | 1 = HELLO、2 = CHAT、3 = VOICE(予約・未実装)、4 = POS(位置ビーコン、T-Deck v14〜) |
 | to_mac | uint8[6] | 宛先MAC。全ゼロ = ブロードキャスト |
 | name | char[16] | 送信者名(ニックネーム) |
 | text | char[200] | 本文(UTF-8) |
@@ -28,6 +28,14 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
   - 通信する同士は同じチャンネルに合わせること。
 - Long Range モード: Preferences "chat" / "lr"。
   使う場合は全機で LR に統一する(混在すると片方向になる場合がある)。
+
+### 位置ビーコン(type 4、T-Deck v14〜)
+
+- `text` に `latE6,lonE6,altM`(10 進 ASCII、緯度経度は 10^6 倍の整数、
+  高度は m)を入れてブロードキャストする。
+- 受信側は送信者ピアに位置を保持し(鮮度 30 分)、ピア一覧で
+  距離・方角、地図画面でマーカー表示に使う。チャット行としては表示しない。
+- 旧ファームは未知タイプとして無視するので、混在しても問題ない。
 
 ### SD カードのチャットログ
 
@@ -51,6 +59,8 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
   (LoRa メッシュの隙間を ESP-NOW で埋めるラストワンマイル構成)
 - 送信電力 13 dBm 以下、送信前にキャリアセンス(LBT)必須
 - フレーム: `[type][id16][nameLen][name][text]`
+  (type: 1 = HELLO、2 = CHAT、3 = POS(位置ビーコン。text の形式は
+  ESP-NOW の type 4 と同じ `latE6,lonE6,altM`。名前でピアに紐付ける))
 - HELLO は 90 秒ごと
 - LoRa 経由で届いた行は、表示名の後ろに `(L)` を付けて表示する
 - ホーム画面のターミナルから送ると、ESP-NOW と LoRa の両方に出る
@@ -70,3 +80,7 @@ ENZ CoT(Chat of Things)シリーズの「共通語」。全機種がこの規約
   無い場合はかな入力のみ(変換なし)。
 - `/music` — 音楽ファイル置き場(MP3 / WAV、機種により対応が異なる)。
 - `/picture` — CYD のスライドショー用画像置き場。
+- `/presshist.bin` — CYD の気圧 24 時間履歴ミラー(CLEAN 版が読み書き)。
+- `/maps/<z>/<x>/<y>.jpg` — T-Deck 地図画面用の国土地理院タイル
+  キャッシュ。PC 側で `tools/gsi_cache.py` を使って用意する
+  (出典: 国土地理院)。
