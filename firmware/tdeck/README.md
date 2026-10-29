@@ -8,7 +8,8 @@ ESP-NOW と LoRa の両対応で、ホーム画面は CYD 風
 
 - チャット: ESP-NOW(CYD / M5Core2 と互換)+ LoRa(920.8 MHz、STD-T108 準拠。
   設定で変調プロファイル Std / Narrow / MeshCore(実験用リスニング、
-  生パケット RAW ログ付き)を切替可能)
+  生パケット RAW ログ付き)を切替可能。MeshCore モードでは RAW 画面で
+  ADVERT パケットの解読表示(公開鍵・時刻・ノード名、署名検証は未実装)
   ホームのターミナルからは両方に同時送信
 - 日本語入力: **Alt+C** で英数/日本語を切替(Alt+Space はキーボード
   ファーム側で検出できないため)。SKK 変換は Space、候補送りは n / N
