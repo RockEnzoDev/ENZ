@@ -1,7 +1,26 @@
-# ENZ Series
+# ENZ CoT — Chat of Things
 
-通信互換性を持つ自作デバイスのシリーズです。どの機種も同じチャットプロトコル
-([docs/PROTOCOL.md](docs/PROTOCOL.md))で会話でき、家族のように増やしていけます。
+```
+CYD> おはよう、気圧下がってきた
+M5Core2> おはよう。こっちは電池100%
+T-Deck (L)> 山の上からでも聞こえる?
+```
+
+**ネットがなくても、話せる。**
+すべてのガジェットが、チャットできる。
+No cloud. No account. Just chat.
+
+IoT が「モノがネットにつながる」なら、CoT は「モノ同士がおしゃべりする」。
+ENZ CoT は、ESP-NOW と LoRa で直接会話する自作デバイスのシリーズです。
+サーバーもアカウントも要りません。電源を入れたら、もう会話が始まっています。
+
+## コンセプト
+
+- **参加条件は「話せること」** — 時計でも、キーボード端末でも、画面のない
+  ボタンでも。会話に参加できれば、シリーズの一員です
+- **共通語は1つ** — 全機種が [CoT プロトコル](docs/PROTOCOL.md)
+  (223 バイトの共通パケット)で話します。新機種はまず「話せる」ことから作ります
+- **日本語で話す** — かな入力と SKK 変換まで、全機種の共通仕様です
 
 ## 機種一覧
 
@@ -12,14 +31,14 @@
 | LILYGO T-Deck | [firmware/tdeck](firmware/tdeck) | 物理キーボード端末。チャット(ESP-NOW + LoRa)・センサー・音楽 | 実機確認済み(Phase 1) |
 | RP2350-USB (Tenstar) | [firmware/rp2350](firmware/rp2350) | USBボタン(F13)。シリーズの入力デバイス基盤 | コンパイル検証済み |
 
-今後の予定: Stamp C3 無線コールボタン、RP2350 + ESP32-C3 ペア(ENZ BASE)、
-音声PTT(プロトコルの type 3 を予約済み)。
+今後の予定: Elecrow CrowPanel Advance、Stamp C3 無線コールボタン、
+RP2350 + ESP32-C3 ペア(ENZ BASE)、音声 PTT(CoT プロトコルの type 3 を予約済み)。
 
 ## 共通資産
 
-- [assets/sd](assets/sd) — 全機種共通のSDカード用ファイル
-  - `jpfont16.bin` — 日本語フォント(16px)。SD直下に置く
-  - `skk.dic` — SKK変換辞書。SD直下に置く(無くてもかな入力のみ可能)
+- [assets/sd](assets/sd) — 全機種共通の SD カード用ファイル
+  - `jpfont16.bin` — 日本語フォント(16px)。SD 直下に置く
+  - `skk.dic` — SKK 変換辞書。SD 直下に置く(無くてもかな入力のみ可能)
 - [tools](tools) — `make_skk_dic_4_ng5x.py`(skk.dic 生成スクリプト)
 
 ## ビルド環境(共通)
