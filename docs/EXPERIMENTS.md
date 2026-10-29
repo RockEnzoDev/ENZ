@@ -72,6 +72,20 @@
   RAW 画面に表示する。署名(Ed25519)の検証はまだしない。
   実機で WADAMESH のノード名が読めるか確認待ち
 
+## 2026-10-29 Launcher 展開(Core2 / T-Deck)
+
+- 対象: ENZ_CORE2_v5 / ENZ_TDECK_v14 の Launcher 用 .bin
+- 試したこと: GitHub リリースに置いた .bin を Launcher の
+  Favorites / SD 経由でインストールして起動するか確認。
+  T-Deck 版は app3M パーティション向け(1,144,720 bytes)で、
+  Launcher 側のアプリ枠に収まるかが未知数だった
+- 結果: 両機とも成功(2026-10-29 夜、実機確認)。T-Deck は
+  無印と Plus の両方で起動確認。3 MB 級アプリでも枠の問題なし。
+  Core2 の通信(ESP-NOW チャット)も OK
+- 分かったこと: リリース命名規則 ENZ_<機種>_v<版数>(タグ・
+  タイトル・ファイル名を統一)で、GitHub から OTA する運用が
+  全対応機種で回るようになった
+
 ## 2026-10-29 M5Core2 の Bluetooth A2DP 送信
 
 - 対象: M5Core2 v5(v4 で追加した Bluetooth A2DP ソース機能)
