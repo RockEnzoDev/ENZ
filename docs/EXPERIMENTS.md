@@ -25,6 +25,19 @@
 - 次に試すなら: モジュール自体の載せ替え。新しい WROOM-1 なら
   eFuse 未焼成でロックが無いので一番確実(後回し中)
 
+## 2026-10-29 Launcher パイロット(CYD)
+
+- 対象: bmorcelli Launcher + ENZ_LAUNCHER_OUTDOOR_CLEAN.bin
+- 試したこと: Launcher を CYD に焼き、.bin をインストールして
+  ENZ ファームが起動するか確認(リリース v0.1.0-launcher-pilot)
+- 結果: 成功(2026-10-29 夜、実機確認)。起動・動作とも問題なし。
+  Name / Location / Altitude / ESP-NOW 設定などの個人設定も
+  NVS に保持されたまま引き継がれた
+- 分かったこと: 気圧の 24 時間グラフだけは "collecting..." に
+  戻る。履歴は RAM 上の配列で持つ設計のため、再起動のたびに
+  リセットされる(USB 直焼きでも同じ)。Launcher でファームを
+  行き来する運用では実害になるので、履歴の SD 保存を検討中
+
 ## 2026-10-29 MeshCore 実験 Stage 1(受信のみ)
 
 - 対象: T-Deck v12(MeshCore リスニングプロファイル)
