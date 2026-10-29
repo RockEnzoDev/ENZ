@@ -20,6 +20,13 @@ ENZ CoT は、ESP-NOW と LoRa で直接会話する自作デバイスのシリ�
 ENZ CoT が提案するのは、スマホの代わりではなく「2台目の専用機」。
 全部入りを目指さず、スマホが苦手な仕事だけを引き受けます。
 
+どの機種も作りは同じで、**「軸になる機能 + チャット」**。
+M5Core2 は小型音楽プレイヤーのオマケにチャット、CYD は部屋時計の
+オマケにチャット、T-Deck は主役がチャットそのものの
+オフラインチャットマシーン。チャットはオマケですが、家族が増えるほど
+豪華になるオマケです。新機種の作法は「まず何の専用機か決める。
+チャットは必ず付く」。
+
 - **参加条件は「話せること」** — 時計でも、キーボード端末でも、画面のない
   ボタンでも。会話に参加できれば、シリーズの一員です
 - **共通語は1つ** — 全機種が [CoT プロトコル](docs/PROTOCOL.md)
@@ -33,13 +40,14 @@ ENZ CoT が提案するのは、スマホの代わりではなく「2台目の�
 
 | 機種 | フォルダ | 役割 | 状態 |
 |---|---|---|---|
-| CYD (ESP32-2432S028) | [firmware/cyd](firmware/cyd) | 屋外用ランチャー / 屋内用ランチャー。時計・センサー・天気・チャット端末 | 実機確認済み |
-| M5Core2 | [firmware/m5core2](firmware/m5core2) | コンパニオン。時計(RTC)・チャット・音楽プレーヤー・Bluetooth音声出力 | 実機確認済み |
-| LILYGO T-Deck | [firmware/tdeck](firmware/tdeck) | 物理キーボード端末。チャット(ESP-NOW + LoRa)・センサー・音楽 | 実機確認済み(Phase 1) |
+| CYD (ESP32-2432S028) | [firmware/cyd](firmware/cyd) | 部屋時計、のオマケにチャット(時計・センサー・天気。屋外版/屋内版) | 実機確認済み |
+| M5Core2 | [firmware/m5core2](firmware/m5core2) | 小型音楽プレイヤー、のオマケにチャット(Bluetooth音声出力つき) | 実機確認済み |
+| LILYGO T-Deck | [firmware/tdeck](firmware/tdeck) | オフラインチャットマシーン(ESP-NOW + LoRa、物理キーボード) | 実機確認済み(Phase 1) |
 | RP2350-USB (Tenstar) | [firmware/rp2350](firmware/rp2350) | USBボタン(F13)。シリーズの入力デバイス基盤 | コンパイル検証済み |
 
-今後の予定: Elecrow CrowPanel Advance、Stamp C3 無線コールボタン、
-RP2350 + ESP32-C3 ペア(ENZ BASE)、音声 PTT(CoT プロトコルの type 3 を予約済み)。
+今後の予定: Elecrow CrowPanel Advance、M5Stick(ボイスレコーダーの
+オマケにチャット)、Stamp C3 無線コールボタン、RP2350 + ESP32-C3 ペア
+(ENZ BASE)、音声 PTT(CoT プロトコルの type 3 を予約済み)。
 
 ## 共通資産
 
