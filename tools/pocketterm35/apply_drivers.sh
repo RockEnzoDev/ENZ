@@ -19,6 +19,11 @@ BOOT=/boot/firmware
 echo "== install Waveshare DPI overlays =="
 sudo install -m 644 drivers/waveshare-35dpi-4b.dtbo \
                     drivers/waveshare-35dpi-5b.dtbo "$BOOT/overlays/"
+# Verify: stock RPi OS ships its own 5b WITHOUT the ft6236@5d node,
+# which leaves touch dead. The harvested files must match these md5s:
+md5sum "$BOOT/overlays/waveshare-35dpi-4b.dtbo" "$BOOT/overlays/waveshare-35dpi-5b.dtbo"
+echo "  expected 4b: 8fba10fbec8b95fc6c1aea8bae56592a"
+echo "  expected 5b: ec0dae463e40becc7e9124b97e7537fb"
 
 echo "== patch config.txt =="
 CFG="$BOOT/config.txt"
