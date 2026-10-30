@@ -53,6 +53,10 @@ Paper(電子ペーパー掲示板、手持ち在庫から)、LILYGO T-Deck Plus
 オマケにチャット。LoRa 付きは通常版のみ)、Stamp C3 無線コールボタン、
 RP2350 + ESP32-C3 ペア(ENZ BASE)、音声 PTT(CoT プロトコルの
 type 3 を予約済み)。
+Wi-Fi HaLow(IEEE 802.11ah)への対応も構想中。T-Deck(無線番長)に
+SPI/SDIO の外付けモジュールとして追加する想定で、日本の割当て・
+制度整備が固まるのを待って着手する。IP がそのまま通るため、
+CoT の長距離・高速な伝送路として位置づける。
 手持ちの Meshtastic 機材(Unit C6L ×2、Wio Tracker L1 Pro、Cardputer ADV、
 T-Echo Lite、XIAO nRF52 / ESP32 + Wio-SX1262 キット ×各3)も順次
 CoT ノード化する。ESP32 系は ESP-NOW + LoRa のフルノードに、nRF52 系は
