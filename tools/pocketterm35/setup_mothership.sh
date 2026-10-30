@@ -13,9 +13,49 @@ set -euo pipefail
 MS="$HOME/mothership"
 mkdir -p "$MS" "$HOME/bin"
 
-echo "== [0/6] Japanese fonts/IME + keyboard layout =="
+echo "== [0/7] Japanese fonts/IME + keyboard layout =="
 sudo apt-get update
-sudo apt-get install -y fonts-noto-cjk ibus-mozc
+# IME is fcitx5 + Mozc, NOT IBus: on trixie/labwc, IBus switched engines
+# and ran mozc_server yet never delivered conversion to any app
+# (isolation-tested in Mousepad, 2026-10-31). fcitx5 works everywhere,
+# including the Chromium kiosk via text-input-v3.
+sudo apt-get install -y fonts-noto-cjk fcitx5 fcitx5-mozc
+mkdir -p "$HOME/.config/fcitx5"
+if [ ! -f "$HOME/.config/fcitx5/profile" ]; then
+  cat > "$HOME/.config/fcitx5/profile" <<'EOF'
+[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=mozc
+
+[Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
+Name=mozc
+Layout=
+
+[GroupOrder]
+0=Default
+EOF
+fi
+# IM modules for the whole labwc session (toggle: Ctrl+Space).
+mkdir -p "$HOME/.config/labwc"
+touch "$HOME/.config/labwc/environment"
+for kv in GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx 'XMODIFIERS=@im=fcitx'; do
+  k="${kv%%=*}"
+  if grep -q "^$k=" "$HOME/.config/labwc/environment"; then
+    sed -i "s|^$k=.*|$kv|" "$HOME/.config/labwc/environment"
+  else
+    echo "$kv" >> "$HOME/.config/labwc/environment"
+  fi
+done
+# No on-screen keyboard: the device has a physical one, and squeekboard
+# pops up over the Muse login screen.
+mkdir -p "$HOME/.config/autostart"
+printf '[Desktop Entry]\nType=Application\nName=Squeekboard\nHidden=true\nX-GNOME-Autostart-enabled=false\n' \
+  > "$HOME/.config/autostart/squeekboard.desktop"
 # The PocketTerm35 Pico keyboard is US layout. The labwc desktop takes
 # its layout from XKB_DEFAULT_LAYOUT in the labwc environment files
 # (Imager/cloud-init writes gb then jp there; /etc/default/keyboard
@@ -27,19 +67,19 @@ grep -q '^XKB_DEFAULT_LAYOUT=' "$HOME/.config/labwc/environment" 2>/dev/null || 
   echo 'XKB_DEFAULT_LAYOUT=us' >> "$HOME/.config/labwc/environment"
 sudo sed -i 's/XKBLAYOUT="jp"/XKBLAYOUT="us"/' /etc/default/keyboard || true
 
-echo "== [1/6] system packages =="
+echo "== [1/7] system packages =="
 sudo apt-get update
 sudo apt-get install -y git python3-pip python3-venv screen minicom \
   i2c-tools usbutils curl unzip
 
-echo "== [2/6] esptool (flashing) =="
+echo "== [2/7] esptool (flashing) =="
 if ! command -v esptool >/dev/null 2>&1 && ! python3 -m esptool version >/dev/null 2>&1; then
   python3 -m pip install --user --break-system-packages esptool || \
   python3 -m pip install --user esptool
 fi
 python3 -m esptool version || true
 
-echo "== [3/6] arduino-cli =="
+echo "== [3/7] arduino-cli =="
 if [ ! -x "$HOME/bin/arduino-cli" ]; then
   curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
     | BINDIR="$HOME/bin" sh
@@ -57,21 +97,21 @@ if [ "${WITH_CORES:-0}" = "1" ]; then
   arduino-cli core install rp2040:rp2040 || true
 fi
 
-echo "== [4/6] ENZ repo =="
+echo "== [4/7] ENZ repo =="
 if [ ! -d "$MS/ENZ/.git" ]; then
   git clone https://github.com/RockEnzoDev/ENZ.git "$MS/ENZ"
 else
   git -C "$MS/ENZ" pull --ff-only || true
 fi
 
-echo "== [5/6] Tailscale =="
+echo "== [5/7] Tailscale =="
 if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 echo "   -> after this script finishes, run:  sudo tailscale up"
 echo "   -> and enable SSH:                   sudo tailscale set --ssh"
 
-echo "== [6/6] helper: cot-flash =="
+echo "== [6/7] helper: cot-flash =="
 cat > "$HOME/bin/cot-flash" <<'EOF'
 #!/usr/bin/env bash
 # usage: cot-flash <serial-port> <bin-file> [offset] [chip]
@@ -85,6 +125,20 @@ OFF="${3:-0x10000}"; CHIP="${4:-auto}"
 python3 -m esptool --chip "$CHIP" --port "$PORT" write-flash "$OFF" "$BIN"
 EOF
 chmod +x "$HOME/bin/cot-flash"
+
+echo "== [7/7] Muse terminal face: IM daemon, kiosk, screen blanking =="
+# Power on -> desktop -> fcitx5 up -> Chromium fullscreen on muse.ai,
+# screen blanks after 10 min idle (any key/touch wakes it).
+mkdir -p "$HOME/.config/labwc" "$HOME/.config/swayidle"
+AUTOSTART="$HOME/.config/labwc/autostart"
+touch "$AUTOSTART"
+grep -q '^fcitx5 -d' "$AUTOSTART" || echo 'fcitx5 -d &' >> "$AUTOSTART"
+grep -q '^swayidle' "$AUTOSTART" || echo 'swayidle &' >> "$AUTOSTART"
+grep -q 'muse.ai' "$AUTOSTART" || \
+  echo 'env LANG=ja_JP.UTF-8 GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx chromium --kiosk --enable-wayland-ime --wayland-text-input-version=3 --noerrdialogs --disable-session-crashed-bubble --disable-infobars https://muse.ai &' >> "$AUTOSTART"
+cat > "$HOME/.config/swayidle/config" <<'EOF'
+timeout 600 'wlopm --off HDMI-A-1' resume 'wlopm --on HDMI-A-1'
+EOF
 
 echo
 echo "DONE. Mothership home: $MS"

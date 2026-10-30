@@ -27,11 +27,22 @@ echo "  expected 5b: ec0dae463e40becc7e9124b97e7537fb"
 
 echo "== patch config.txt =="
 CFG="$BOOT/config.txt"
+# A line only counts if it sits inside an [all] block: the stock
+# config.txt already contains "dtoverlay=dwc2,dr_mode=host" under
+# [cm5], where it does nothing on a Pi 4 -- a plain whole-file grep
+# once skipped the append and left the keyboard dead (2026-10-30).
+ensure_all() {
+  awk -v want="$1" '
+    /^\[/ { inall = ($0 == "[all]") }
+    inall && $0 == want { found = 1 }
+    END { exit !found }
+  ' "$CFG" || printf '[all]\n%s\n' "$1" | sudo tee -a "$CFG" >/dev/null
+}
 for line in "dtparam=i2c_arm=on" \
             "dtoverlay=waveshare-35dpi-4b" \
             "dtoverlay=waveshare-35dpi-5b" \
             "dtoverlay=dwc2,dr_mode=host"; do
-  grep -qx "$line" "$CFG" || echo "$line" | sudo tee -a "$CFG" >/dev/null
+  ensure_all "$line"
 done
 
 echo "== WiFi regdom -> JP =="
