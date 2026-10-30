@@ -1,11 +1,15 @@
 // ============================================================
-//  ENZ T-DECK v14 "RADIO BANCHO" -- LILYGO T-Deck companion
+//  ENZ T-DECK v15 "RADIO BANCHO" -- LILYGO T-Deck companion
 //  The all-radio terminal of the ENZ CoT family: ESP-NOW chat
 //  (byte-compatible with CYD / M5Core2), LoRa text + MeshCore
 //  monitor, Si4703 FM radio (RDS), and on the T-Deck Plus an
 //  onboard-GPS position beacon + cached GSI map viewer.
 //  No clock UI (GPS time quietly sets the system clock), no
 //  music, no onboard sensors -- radios only.
+//  v15 adds: RF band scanner (920.6-923.4 RSSI sweep), SOS
+//  beacon on the GPS screen (both radios, 10x every 30 s),
+//  peer proximity from ESP-NOW RSSI, and MeshCore RAW capture
+//  logging to SD (/meshcore_raw.log) for later PC decoding.
 // ============================================================
 #include <Arduino.h>
 #define LILYGO_LGFX_USE_T_DECK
@@ -100,7 +104,7 @@ static bool gtTouch(int *outX, int *outY) {
 #define KC_NORMAL UI_CARD
 #define KC_ACT    Lcd.color565(10, 48, 22)
 
-enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_SET, SC_RAW, SC_RADIO, SC_GPS, SC_MAP };
+enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_SET, SC_RAW, SC_RADIO, SC_GPS, SC_MAP, SC_SCAN };
 static Screen screen = SC_HOME;
 static bool needsRedraw = true;
 static Preferences prefs;
@@ -311,7 +315,8 @@ static_assert(sizeof(MsgPacket) == 223, "packet size");
 #define HELLO_INTERVAL_MS 5000
 #define PEER_TIMEOUT_MS 30000
 struct ChatPeer { uint8_t mac[6]; char name[16]; unsigned long lastSeen; bool hasUnread;
-                  int32_t latE6; int32_t lonE6; int16_t altM; unsigned long posAt; };
+                  int32_t latE6; int32_t lonE6; int16_t altM; unsigned long posAt;
+                  int rssi; unsigned long rssiAt; };   // ESP-NOW RSSI (v15 proximity)
 static ChatPeer chatPeers[MAX_PEERS];
 static int chatPeerCount = 0;
 static uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -323,7 +328,7 @@ static bool chatLR = false;
 static int loraProf = 0;   // LoRa modem profile: 0 = CoT Std, 1 = Narrow, 2 = MeshCore listen (pref "chat"/"lprof")
 static bool chatOn = false;
 static unsigned long lastHello = 0;
-struct RxSlot { uint8_t mac[6]; uint8_t data[sizeof(MsgPacket)]; int len; };
+struct RxSlot { uint8_t mac[6]; uint8_t data[sizeof(MsgPacket)]; int len; int8_t rssi; };
 #define RX_SLOTS 6
 static volatile RxSlot msgRx[RX_SLOTS];
 static volatile uint8_t msgRxHead = 0, msgRxTail = 0;
@@ -394,6 +399,7 @@ static int findOrAddPeer(const uint8_t* mac) {
   chatPeers[idx].lastSeen = 0;
   chatPeers[idx].hasUnread = false;
   chatPeers[idx].latE6 = 0; chatPeers[idx].lonE6 = 0; chatPeers[idx].altM = 0; chatPeers[idx].posAt = 0;
+  chatPeers[idx].rssi = 0; chatPeers[idx].rssiAt = 0;
   return idx;
 }
 static int ensureGroupPeer() {
@@ -417,19 +423,22 @@ static void appendGroupLog(const String& who, const String& text) {
   f.print(who); f.print('|'); f.print(text); f.print('\n');
   f.close();
 }
-static void msgRecvCommon(const uint8_t* mac, const uint8_t* data, int len) {
+static void msgRecvCommon(const uint8_t* mac, const uint8_t* data, int len, int rssi) {
   uint8_t next = (msgRxHead + 1) % RX_SLOTS;
   if (next == msgRxTail) return;
   if (len > (int)sizeof(MsgPacket)) len = sizeof(MsgPacket);
   memcpy((void*)msgRx[msgRxHead].mac, mac, 6);
   memcpy((void*)msgRx[msgRxHead].data, data, len);
   msgRx[msgRxHead].len = len;
+  msgRx[msgRxHead].rssi = (int8_t)rssi;
   msgRxHead = next;
 }
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-void onMsgRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) { msgRecvCommon(info->src_addr, data, len); }
+void onMsgRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  msgRecvCommon(info->src_addr, data, len, info->rx_ctrl ? (int)info->rx_ctrl->rssi : 0);
+}
 #else
-void onMsgRecv(const uint8_t* mac, const uint8_t* data, int len) { msgRecvCommon(mac, data, len); }
+void onMsgRecv(const uint8_t* mac, const uint8_t* data, int len) { msgRecvCommon(mac, data, len, 0); }
 #endif
 static void ensurePeer(const uint8_t* mac) {
   if (esp_now_is_peer_exist(mac)) return;
@@ -494,6 +503,7 @@ void processChatRx() {
     RxSlot slot;
     memcpy(slot.mac, (const void*)msgRx[msgRxTail].mac, 6);
     slot.len = msgRx[msgRxTail].len;
+    slot.rssi = msgRx[msgRxTail].rssi;
     memcpy(slot.data, (const void*)msgRx[msgRxTail].data, slot.len);
     msgRxTail = (msgRxTail + 1) % RX_SLOTS;
     if (slot.len < 8) continue;
@@ -503,6 +513,7 @@ void processChatRx() {
     if (macEq(slot.mac, myMac)) continue;
     int idx = findOrAddPeer(slot.mac);
     if (idx < 0) continue;
+    if (slot.rssi) { chatPeers[idx].rssi = slot.rssi; chatPeers[idx].rssiAt = millis(); }
     if (m.name[0]) { strncpy(chatPeers[idx].name, m.name, 15); chatPeers[idx].name[15] = 0; }
     chatPeers[idx].lastSeen = millis();
     if (m.type == 1) {                       // HELLO
@@ -558,6 +569,34 @@ struct RawPkt { uint32_t at; int rssi; uint8_t len; uint8_t data[160]; };
 static RawPkt rawLog[RAW_N];
 static int rawCount = 0;
 static uint32_t rawTotal = 0;
+// v15: every captured MeshCore packet is also appended to SD as
+// /meshcore_raw.log (one line: ISO time or ms, len, rssi, full hex)
+// so a capture session can be decoded later on a PC. The file is
+// restarted when it passes 1 MB. Format per line:
+//   2026-10-30T01:02:03Z len=111 rssi=-40 data=1200E9...
+static uint32_t rawSdCount = 0;
+// NOTE: primitive params only -- a sketch-defined struct type in the
+// signature breaks Arduino's auto-generated prototypes (v13 lesson).
+static void rawSdAppend(uint32_t atMs, int rssi, int len, const uint8_t* data) {
+  if (!sdReady) return;
+  {
+    File chk = SD.open("/meshcore_raw.log", FILE_READ);
+    if (chk) { uint32_t sz = chk.size(); chk.close(); if (sz > 1048576UL) SD.remove("/meshcore_raw.log"); }
+  }
+  File f = SD.open("/meshcore_raw.log", FILE_APPEND);
+  if (!f) return;
+  time_t tt = time(nullptr);
+  char ts[28];
+  if (tt > 1700000000) {
+    struct tm t; gmtime_r(&tt, &t);
+    snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+  } else snprintf(ts, sizeof(ts), "ms%lu", (unsigned long)atMs);
+  f.print(ts); f.print(" len="); f.print(len); f.print(" rssi="); f.print(rssi); f.print(" data=");
+  for (int i = 0; i < len; i++) { char hx[3]; snprintf(hx, sizeof(hx), "%02X", data[i]); f.print(hx); }
+  f.print('\n');
+  f.close();
+  rawSdCount++;
+}
 // MeshCore ADVERT decode (Stage 2). Packet: [header][path_len][path...]
 // then payload: pubkey[32], timestamp LE32, signature[64], flags[1],
 // optional lat/lon (flags bit0, 8 bytes), then the node name to the end.
@@ -627,8 +666,53 @@ static bool loraSendFrame(uint8_t type, const String& text) {
   radio.startReceive();
   return st == RADIOLIB_ERR_NONE;
 }
+// ============================================================
+//  RF SCANNER (v15): sweeps 920.6-923.4 MHz in 0.2 MHz steps and
+//  draws live RSSI bars so the band's occupancy is visible. While
+//  the scanner screen is up, CoT LoRa RX/TX is paused (the SX1262
+//  is busy sweeping); leaving the screen restores 920.8 RX.
+// ============================================================
+#define SCAN_N 15
+static bool scanRunning = false;
+static int scanIdx = 0;
+static int scanRssi[SCAN_N];
+static float scanFreqMhz(int i) { return 920.6f + 0.2f * i; }   // index 1 = 920.8 (CoT)
+static void scanEnter() {
+  if (!loraReady) return;
+  for (int i = 0; i < SCAN_N; i++) scanRssi[i] = -120;
+  scanIdx = 0;
+  scanRunning = true;
+}
+static void scanExit() {
+  if (!scanRunning) return;
+  scanRunning = false;
+  if (loraReady) { radio.setFrequency(LORA_FREQ); radio.startReceive(); }
+}
+static void scanTick() {
+  static bool dwell = false;
+  static unsigned long dueAt = 0;
+  if (!scanRunning || !loraReady) return;
+  unsigned long now = millis();
+  if (!dwell) {
+    radio.setFrequency(scanFreqMhz(scanIdx));
+    radio.startReceive();
+    dueAt = now + 9;
+    dwell = true;
+    return;
+  }
+  if (now >= dueAt) {
+    int r = (int)radio.getRSSI();
+    if (r < -120) r = -120;
+    if (r > 0) r = 0;
+    scanRssi[scanIdx] = r;
+    scanIdx++;
+    dwell = false;
+    if (scanIdx >= SCAN_N) { scanIdx = 0; needsRedraw = true; }
+  }
+}
 static void loraPoll() {
   if (!loraReady) return;
+  if (scanRunning) { loraRxFlag = false; return; }   // scanner owns the radio
   if (loraRxFlag) {
     loraRxFlag = false;
     uint8_t buf[255];
@@ -641,6 +725,7 @@ static void loraPoll() {
         memmove(&rawLog[1], &rawLog[0], sizeof(RawPkt) * (RAW_N - 1));
         rawLog[0] = rp; if (rawCount < RAW_N) rawCount++;
         rawTotal++;
+        rawSdAppend(rp.at, rp.rssi, rp.len, rp.data);
         if (screen == SC_RAW) needsRedraw = true;
       } else if (len >= 4) {
       uint8_t type = buf[0];
@@ -1238,6 +1323,58 @@ static void sendPosBeacon() {
   termPush("GPS", String("POS ") + tb);
   if (screen == SC_GPS) needsRedraw = true;
 }
+// ============================================================
+//  SOS BEACON (v15): an armed two-tap action on the GPS screen.
+//  Sends a POS beacon (when a fix exists) plus an "SOS <name>
+//  <latE6,lonE6,altM | NOFIX>" CHAT line over BOTH radios, then
+//  repeats every 30 s, 10 times total, or until stopped. Any
+//  received chat line whose text starts with "SOS " is drawn in
+//  alarm red on the home terminal and the chat screen.
+// ============================================================
+static bool sosActive = false;
+static int sosLeft = 0;
+static unsigned long sosNextAt = 0;
+static bool sosArm = false;
+static unsigned long sosArmAt = 0;
+static void sosSendOnce() {
+  if (gpsFix) sendPosBeacon();
+  char tb[72];
+  if (gpsFix) snprintf(tb, sizeof(tb), "SOS %s %ld,%ld,%d", myName.c_str(), (long)gpsLatE6, (long)gpsLonE6, (int)lroundf(gpsAltM));
+  else snprintf(tb, sizeof(tb), "SOS %s NOFIX", myName.c_str());
+  int gi = ensureGroupPeer();
+  if (gi >= 0 && chatOn) sendChatMsg(gi, String(tb));
+  loraSendFrame(2, String(tb));
+  appendGroupLog("Me", String(tb));
+  termPush("Me", String(tb));
+}
+static void sosButtonTap() {
+  if (sosActive) { sosActive = false; termPush("SOS", "beacon stopped"); needsRedraw = true; return; }
+  if (sosArm && millis() - sosArmAt < 3000) {
+    sosArm = false;
+    sosActive = true;
+    sosLeft = 10;
+    sosSendOnce();
+    sosLeft--;
+    sosNextAt = millis() + 30000;
+    termPush("SOS", "beacon started (10x, every 30 s)");
+  } else { sosArm = true; sosArmAt = millis(); }
+  needsRedraw = true;
+}
+static const char* sosBtnLabel() {
+  if (sosActive) return "SOS ACTIVE - TAP: STOP";
+  if (sosArm && millis() - sosArmAt < 3000) return "TAP AGAIN: SEND SOS";
+  return "SOS BEACON";
+}
+static void sosTick() {
+  if (sosArm && millis() - sosArmAt >= 3000) { sosArm = false; if (screen == SC_GPS) needsRedraw = true; }
+  if (!sosActive) return;
+  if (millis() >= sosNextAt) {
+    sosSendOnce();
+    if (--sosLeft <= 0) { sosActive = false; termPush("SOS", "beacon finished"); }
+    else sosNextAt = millis() + 30000;
+    if (screen == SC_GPS) needsRedraw = true;
+  }
+}
 static void distBrg(int32_t la1, int32_t lo1, int32_t la2, int32_t lo2, float* dm, float* brg) {
   float dLa = (la2 - la1) * 1e-6f, dLo = (lo2 - lo1) * 1e-6f;
   float mLa = (la1 + la2) * 0.5e-6f * 0.01745329f;
@@ -1260,6 +1397,9 @@ static void drawGps() {
     txt("Onboard GPS is a T-Deck Plus feature;", 12, 74, UI_DIM, 1);
     txt("on the Plus it needs a view of the sky.", 12, 90, UI_DIM, 1);
     txt("RX/TX auto-swap is tried at 20 s.", 12, 116, UI_MUTE, 1);
+    txt("SOS still works: it sends your name", 12, 140, UI_DIM, 1);
+    txt("with NOFIX over both radios.", 12, 156, UI_DIM, 1);
+    hbtn(60, 190, 200, 40, sosBtnLabel(), KC_NORMAL, UI_BAD);
     return;
   }
   char b[56];
@@ -1275,11 +1415,21 @@ static void drawGps() {
       snprintf(b, sizeof(b), "Last beacon %lus ago", (millis() - lastBeaconAt) / 1000);
       txt(b, 12, 112, UI_MUTE, 1);
     }
-    hbtn(60, 180, 200, 44, "SEND POS", KC_ACT, UI_TEXT);
+    if (sosActive) {
+      snprintf(b, sizeof(b), "SOS ACTIVE: %d sends left", sosLeft);
+      txt(b, 12, 126, UI_BAD, 1);
+    }
+    hbtn(60, 140, 200, 40, "SEND POS", KC_ACT, UI_TEXT);
+    hbtn(60, 190, 200, 40, sosBtnLabel(), KC_NORMAL, UI_BAD);
   } else {
     snprintf(b, sizeof(b), "Searching... SAT %d", gpsSats);
     txt(b, 12, 40, UI_TEXT, 1);
     txt("A fix can take a minute under open sky.", 12, 66, UI_DIM, 1);
+    if (sosActive) {
+      snprintf(b, sizeof(b), "SOS ACTIVE: %d sends left", sosLeft);
+      txt(b, 12, 92, UI_BAD, 1);
+    }
+    hbtn(60, 190, 200, 40, sosBtnLabel(), KC_NORMAL, UI_BAD);
   }
 }
 
@@ -1436,7 +1586,7 @@ static void drawHomeClock() {
 static void drawHomeStatus() {
   Lcd.fillRect(9, 59, SCR_W - 18, 30, UI_CARD);
   char b1[64], b2[64];
-  snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "");
+  snprintf(b1, sizeof(b1), "ESP-NOW %s ch%d%s Online:%d%s%s", chatOn ? "ON" : "OFF", chatChannel, chatLR ? " LR" : "", onlinePeerCount(), anyUnread() ? " [NEW]" : "", sosActive ? " [SOS]" : "");
   txt(b1, 16, 61, UI_TEXT, 1);
   if (loraReady) {
     if (loraProf == 2) snprintf(b2, sizeof(b2), "LoRa 920.8 MESHCR  RX %lu pkts", rawTotal);
@@ -1458,7 +1608,8 @@ static void drawHomeTerminal() {
     String body = bar >= 0 ? termLines[i].substring(bar + 1) : termLines[i];
     String ln = "[" + who + "] " + body;
     bool mine = who == "Me";
-    jpText(fitText(ln, SCR_W - 26).c_str(), 12, y, mine ? UI_ACCENT : UI_TEXT, -1);
+    bool sos = body.startsWith("SOS ");
+    jpText(fitText(ln, SCR_W - 26).c_str(), 12, y, sos ? UI_BAD : (mine ? UI_ACCENT : UI_TEXT), -1);
     y += 18;
   }
   drawComposerLine(12, 216, UI_ACCENT);
@@ -1513,7 +1664,8 @@ static void drawChat() {
   if (start < 0) start = 0;
   for (int i = 0; i < show && start + i < dn; i++) {
     const String& ln = disp[start + i];
-    jpText(ln.c_str(), 10, 30 + i * 19, ln.startsWith("[Me]") ? UI_ACCENT : UI_TEXT, -1, SCR_W - 18);
+    bool sos = ln.indexOf("] SOS ") >= 0;
+    jpText(ln.c_str(), 10, 30 + i * 19, sos ? UI_BAD : (ln.startsWith("[Me]") ? UI_ACCENT : UI_TEXT), -1, SCR_W - 18);
   }
   Lcd.fillRoundRect(6, 204, SCR_W - 12, 30, 6, UI_CARD);
   Lcd.drawRoundRect(6, 204, SCR_W - 12, 30, 6, UI_BORDER);
@@ -1535,6 +1687,12 @@ static void drawPeers() {
     bool on = !macIsZero(chatPeers[i].mac) && chatPeers[i].lastSeen && millis() - chatPeers[i].lastSeen < PEER_TIMEOUT_MS;
     if (i == peerSel) Lcd.fillRoundRect(4, y - 2, SCR_W - 8, 20, 4, KC_ACT);
     String ln = peerName(i) + (macIsZero(chatPeers[i].mac) ? " [ALL]" : (on ? " [ON]" : " [--]")) + (chatPeers[i].hasUnread ? " [NEW]" : "");
+    if (on && chatPeers[i].rssiAt) {   // v15: proximity from ESP-NOW RSSI
+      char rb[20];
+      const char* prox = chatPeers[i].rssi >= -55 ? "NEAR" : (chatPeers[i].rssi >= -75 ? "MID" : "FAR");
+      snprintf(rb, sizeof(rb), " %ddBm %s", chatPeers[i].rssi, prox);
+      ln += rb;
+    }
     if (chatPeers[i].posAt && millis() - chatPeers[i].posAt < 1800000UL) {
       if (gpsFix) {
         float dm, br;
@@ -1586,7 +1744,37 @@ static void drawRaw() {
     }
     if (y > 200) break;
   }
+  if (sdReady) {
+    char sb[56];
+    snprintf(sb, sizeof(sb), "SD log: %lu pkts in /meshcore_raw.log", (unsigned long)rawSdCount);
+    txt(sb, 10, 212, UI_MUTE, 1);
+  }
   txt("ESC / tap top-left: back to peers", 10, 224, UI_MUTE, 1);
+}
+// ---- RF scanner screen ----
+static void drawScan() {
+  Lcd.fillScreen(UI_BG);
+  drawHeader("RF SCAN");
+  txt("920.6-923.4 MHz  step 0.2  (LoRa RX paused)", 10, 26, UI_DIM, 1);
+  if (!loraReady) { txt("LoRa radio not found.", 10, 62, UI_WARN, 1); return; }
+  const int base = 190;
+  Lcd.drawLine(10, base, SCR_W - 10, base, UI_BORDER);
+  int peak = 0;
+  for (int i = 0; i < SCAN_N; i++) if (scanRssi[i] > scanRssi[peak]) peak = i;
+  for (int i = 0; i < SCAN_N; i++) {
+    int x = 14 + i * 19;
+    int h = (scanRssi[i] + 120) * 110 / 90;   // -120..-30 dBm -> 0..110 px
+    if (h < 1) h = 1;
+    if (h > 118) h = 118;
+    uint16_t col = (i == peak) ? UI_WARN : (i == 1 ? UI_ACCENT : UI_DIM);
+    Lcd.fillRect(x, base - h, 13, h, col);
+  }
+  txt("920.6", 12, base + 4, UI_MUTE, 1);
+  txt("920.8=CoT", 52, base + 4, UI_ACCENT, 1);
+  txt("923.4", SCR_W - 44, base + 4, UI_MUTE, 1);
+  char pb[56];
+  snprintf(pb, sizeof(pb), "PEAK %.1f MHz  %d dBm", scanFreqMhz(peak), scanRssi[peak]);
+  txt(pb, 10, 222, UI_TEXT, 1);
 }
 // ---- settings ----
 static bool editingName = false;
@@ -1621,6 +1809,7 @@ static void drawCurrent() {
     case SC_RADIO: drawRadio(); break;
     case SC_GPS: drawGps(); break;
     case SC_MAP: drawMap(); break;
+    case SC_SCAN: drawScan(); break;
   }
 }
 static void goHome() { screen = SC_HOME; needsRedraw = true; }
@@ -1690,10 +1879,14 @@ static void handleKey(int c) {
       else if (c == 'f' || c == 'F') { screen = SC_RADIO; needsRedraw = true; }
       else if (c == 'g' || c == 'G') { screen = SC_GPS; needsRedraw = true; }
       else if (c == 'm' || c == 'M') { mapRecenterGps(); screen = SC_MAP; needsRedraw = true; }
+      else if (c == 's' || c == 'S') { scanEnter(); screen = SC_SCAN; needsRedraw = true; }
       else if (c == 0x1B) goHome();
       break;
     case SC_RAW:
       if (c == 0x1B || c == 0x0D) { screen = SC_PEERS; needsRedraw = true; }
+      break;
+    case SC_SCAN:
+      if (c == 0x1B || c == 0x0D) { scanExit(); screen = SC_PEERS; needsRedraw = true; }
       break;
     case SC_SET:
       if (c == 0x1B) goHome();
@@ -1707,6 +1900,7 @@ static void handleKey(int c) {
       break;
     case SC_GPS:
       if (c == 0x0D || c == 'b' || c == 'B') { sendPosBeacon(); needsRedraw = true; }
+      else if (c == 's' || c == 'S') { sosButtonTap(); }
       else if (c == 0x1B) goHome();
       break;
     case SC_MAP:
@@ -1753,7 +1947,8 @@ static void handleTouch(int tx, int ty) {
         else if (tx < 158) { mapRecenterGps(); screen = SC_MAP; needsRedraw = true; }
         else if (tx < 236) { screen = SC_RADIO; needsRedraw = true; }
         else { screen = SC_SET; needsRedraw = true; }
-      } else if (ty >= 96) { screen = SC_CHAT; if (curPeer < 0) { curPeer = ensureGroupPeer(); if (curPeer >= 0) loadChatLines(curPeer); } needsRedraw = true; }
+      } else if (ty >= 56 && ty < 96) { scanEnter(); screen = SC_SCAN; needsRedraw = true; }
+      else if (ty >= 96) { screen = SC_CHAT; if (curPeer < 0) { curPeer = ensureGroupPeer(); if (curPeer >= 0) loadChatLines(curPeer); } needsRedraw = true; }
       break;
     case SC_CHAT:
       if (ty < 24 && tx < 50) goHome();
@@ -1779,6 +1974,9 @@ static void handleTouch(int tx, int ty) {
     case SC_RAW:
       if (ty < 24 && tx < 50) { screen = SC_PEERS; needsRedraw = true; }
       break;
+    case SC_SCAN:
+      if (ty < 24 && tx < 50) { scanExit(); screen = SC_PEERS; needsRedraw = true; }
+      break;
     case SC_RADIO:
       if (ty < 24 && tx < 50) { goHome(); break; }
       if (ty >= 186 && ty < 226) {
@@ -1790,7 +1988,8 @@ static void handleTouch(int tx, int ty) {
       break;
     case SC_GPS:
       if (ty < 24 && tx < 50) { goHome(); break; }
-      if (ty >= 180 && ty < 224) { sendPosBeacon(); needsRedraw = true; }
+      if (ty >= 140 && ty < 180 && gpsFix) { sendPosBeacon(); needsRedraw = true; }
+      else if (ty >= 190 && ty < 230) { sosButtonTap(); }
       break;
     case SC_MAP:
       if (ty < 24 && tx < 50) { goHome(); break; }
@@ -1899,7 +2098,7 @@ void setup() {
   Lcd.begin(1, (uint8_t)brightnessVal);   // official init: CS pre-deselect + rotation 1
   Lcd.invertDisplay(true);               // this panel batch needs INVON, else colours are inverted
   Lcd.fillScreen(UI_BG);
-  bootType("C:\\> BOOT  ENZ T-DECK v14", 12, 8, UI_ACCENT);
+  bootType("C:\\> BOOT  ENZ T-DECK v15", 12, 8, UI_ACCENT);
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
   sdReady = SD.begin(PIN_SD_CS, SPI, 20000000);
   bootLine(sdReady ? "SD card ............ OK" : "SD card ............ NONE");
@@ -1996,12 +2195,15 @@ void loop() {
     if (cursorActive()) handleTouch(curX, curY);
     else if (screen == SC_PEERS) handleKey(0x0D);
     else if (screen == SC_RAW) { screen = SC_PEERS; needsRedraw = true; }
+    else if (screen == SC_SCAN) { scanExit(); screen = SC_PEERS; needsRedraw = true; }
     else if (screen == SC_HOME) { screen = SC_CHAT; needsRedraw = true; }
   }
   wasTbPress = tbp;
   processChatRx();
   loraPoll();
   gpsPoll();
+  sosTick();
+  if (screen == SC_SCAN) scanTick();
   if (screen == SC_RADIO) fmPoll();
   if (screen == SC_HOME) { homeTick(); cursorShow(); }
   if (screen == SC_CHAT && chatDirty) { chatDirty = false; needsRedraw = true; }

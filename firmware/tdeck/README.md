@@ -1,4 +1,4 @@
-# LILYGO T-Deck コンパニオン — v14「無線番長」
+# LILYGO T-Deck コンパニオン — v15「無線番長」
 
 物理キーボード + トラックボール搭載の**無線専用端末**。
 ESP-NOW / LoRa / MeshCore 監視 / FM ラジオ / GPS(Plus)を
@@ -28,13 +28,25 @@ ESP-NOW / LoRa / MeshCore 監視 / FM ラジオ / GPS(Plus)を
   タイルは PC で `tools/gsi_cache.py` を使って事前に用意する(出典: 国土地理院)
 - トラックボールカーソル: タッチ不良時の保険。Settings → Cursor で
   Auto(最初のタッチまで)/ ON / OFF。押下 = クリック
+- RF スキャナ(v15): 920.6〜923.4 MHz を 0.2 MHz 刻みで掃引し RSSI を
+  バー表示。帯域の混み具合が見える(スキャン中は LoRa の送受信を一時停止)
+- SOS ビーコン(v15): GPS 画面から 2 回タップで発報。位置ビーコン +
+  「SOS 名前 位置」のチャット行を ESP-NOW と LoRa の両方へ、
+  30 秒ごとに 10 回繰り返す。受信した SOS 行は赤く表示される
+- ピア近接表示(v15): ESP-NOW の受信 RSSI から相手一覧に
+  「-62dBm MID」のように距離感を表示(NEAR / MID / FAR)
+- RAW ログの SD 保存(v15): MeshCore モードで受信した生パケットを
+  /meshcore_raw.log に全件記録(時刻・長さ・RSSI・全 HEX)。
+  帰宅後に PC でデコード解析するためのもの(1 MB で自動リスタート)
 
 ## 画面とキー
 
-- ホーム: CHAT(ピア一覧)/ MAP / FM / SET ボタン、ターミナルで入力 → Enter で送信
-- ピア一覧: Enter = 会話、R = RAW ログ、F = FM、G = GPS、M = 地図
+- ホーム: CHAT(ピア一覧)/ MAP / FM / SET ボタン、ターミナルで入力 → Enter で送信。
+  ステータスカードをタップすると RF スキャナが開く
+- ピア一覧: Enter = 会話、R = RAW ログ、F = FM、G = GPS、M = 地図、S = RF スキャナ
 - FM 画面: `,` / `.` = シーク、- / = = 音量
-- GPS 画面: Enter / B = 位置ビーコン送信
+- GPS 画面: Enter / B = 位置ビーコン送信、S = SOS(2 回押しで発報、
+  発報中はもう一度押すと停止)。SOS ボタンはタップでも操作できる
 - 地図画面: + / - = ズーム、C = GPS 位置にセンタリング、
   トラックボール = パン、タップ = その地点を中心に
 
