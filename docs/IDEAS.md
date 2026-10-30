@@ -39,6 +39,11 @@ ptp mesh（katsumoss さん）、地震・台風速報を流す JPEQ（Y1215 さ
   Tab5 は国内販売の完成品で表示が製品に付く。グレーゼロを取る
 - 代償は ESP32-P4 + C6（hosted 無線）で S3 系ファームと別プラットフォームなこと。
   ESP-NOW が hosted で動くかの検証（3ステップ）が、この役割全体の関門になる
+- フォールバック確定: Tab5 が駄目なら CrowPanel Advance 5.0" S3 を買う
+- 他の候補（2026-10-31 調査）: 技適縛りでは極端に減り、結局 WROOM 頼みになる。
+  SenseCAP Indicator（Seeed、3.95" 完成品スレート、スイッチサイエンス販売）は
+  形は良いが気圧センサーが無く、センサー類が RP2040 側にぶら下がる変則構成。
+  Waveshare ESP32-S3-Touch-LCD-4.3B-BOX はケース付きで CrowPanel と同格（WROOM 頼み）
 
 ## 3. 既存コミュニティへの相乗りブリッジ
 
