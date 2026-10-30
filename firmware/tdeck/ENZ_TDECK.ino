@@ -1,5 +1,5 @@
 // ============================================================
-//  ENZ T-DECK v15 "RADIO BANCHO" -- LILYGO T-Deck companion
+//  ENZ T-DECK v16 "RADIO BANCHO" -- LILYGO T-Deck companion
 //  The all-radio terminal of the ENZ CoT family: ESP-NOW chat
 //  (byte-compatible with CYD / M5Core2), LoRa text + MeshCore
 //  monitor, Si4703 FM radio (RDS), and on the T-Deck Plus an
@@ -10,6 +10,8 @@
 //  beacon on the GPS screen (both radios, 10x every 30 s),
 //  peer proximity from ESP-NOW RSSI, and MeshCore RAW capture
 //  logging to SD (/meshcore_raw.log) for later PC decoding.
+//  v16 adds: group voice PTT (MsgPacket type 3, IMA-ADPCM
+//  8 kHz over ESP-NOW, ES7210 mic in, MAX98357A speaker out).
 // ============================================================
 #include <Arduino.h>
 #define LILYGO_LGFX_USE_T_DECK
@@ -24,6 +26,7 @@
 #include <Preferences.h>
 #include <RadioLib.h>
 #include <TJpg_Decoder.h>
+#include <driver/i2s.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -42,6 +45,12 @@
 #define PIN_I2S_BCK   7
 #define PIN_I2S_WS    5
 #define PIN_I2S_DOUT  6
+// ES7210 mic codec (I2C control on the shared bus, own I2S bus for data)
+#define PIN_ES_MCLK   48
+#define PIN_ES_SCK    47
+#define PIN_ES_LRCK   21
+#define PIN_ES_DIN    14
+#define ES7210_ADDR   0x40
 #define PIN_BAT_ADC   4
 #define PIN_TB_R      2    // trackball direction pins (LILYGO UnitTest mapping: G02=right, G01=up, G04=left, G03=down)
 #define PIN_TB_L      1
@@ -104,7 +113,7 @@ static bool gtTouch(int *outX, int *outY) {
 #define KC_NORMAL UI_CARD
 #define KC_ACT    Lcd.color565(10, 48, 22)
 
-enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_SET, SC_RAW, SC_RADIO, SC_GPS, SC_MAP, SC_SCAN };
+enum Screen { SC_HOME, SC_CHAT, SC_PEERS, SC_SET, SC_RAW, SC_RADIO, SC_GPS, SC_MAP, SC_SCAN, SC_VOICE };
 static Screen screen = SC_HOME;
 static bool needsRedraw = true;
 static Preferences prefs;
@@ -498,6 +507,7 @@ static bool anyUnread() {
   for (int i = 0; i < chatPeerCount; i++) if (chatPeers[i].hasUnread) return true;
   return false;
 }
+static void voiceRx(const uint8_t* data, int len, int peerIdx);
 void processChatRx() {
   while (msgRxTail != msgRxHead) {
     RxSlot slot;
@@ -540,9 +550,383 @@ void processChatRx() {
         chatPeers[idx].altM = (int16_t)al; chatPeers[idx].posAt = millis();
         if (screen == SC_PEERS || screen == SC_MAP) needsRedraw = true;
       }
+    } else if (m.type == 3) {                // VOICE (v16): group PTT audio
+      if (macIsZero(m.to_mac)) voiceRx(slot.data, slot.len, idx);
     }
   }
   if (chatOn && millis() - lastHello > HELLO_INTERVAL_MS) { lastHello = millis(); sendHello(); }
+}
+
+// ============================================================
+//  VOICE PTT (v16) -- group voice over ESP-NOW, MsgPacket type 3.
+//  IMA-ADPCM at 8 kHz (4 KB/s), 49 ms per packet, half-duplex:
+//  hold the on-screen PTT zone (or the T key) to talk; incoming
+//  streams play on the speaker. LoRa stays text-only (airtime).
+//  Mic = ES7210 codec (I2C control, dedicated I2S bus I2S_NUM_1,
+//  captured at 16 kHz and decimated to 8 kHz). Speaker = MAX98357A
+//  on I2S_NUM_0 at 8 kHz. Old firmware ignores type 3 (PROTOCOL.md).
+// ============================================================
+#define V_SAMPLES   392                  // samples per packet (49 ms @ 8 kHz)
+#define V_ADPCM     (V_SAMPLES / 2)      // 196 bytes of ADPCM per packet
+#define V_FLAG_START 0x01
+#define V_FLAG_END   0x02
+
+#pragma pack(push, 1)
+struct VoicePkt {                        // mirrors MsgPacket's head layout
+  uint8_t type;                          // 3
+  uint8_t to_mac[6];                     // all zero = group
+  char    name[16];
+  uint8_t seq;
+  uint8_t flags;
+  uint8_t len;                           // ADPCM bytes used (0..V_ADPCM)
+  uint8_t data[V_ADPCM];
+};
+#pragma pack(pop)
+
+// ---- IMA-ADPCM codec (standard tables) ----
+static const int8_t ADPCM_IDX[16] = { -1,-1,-1,-1, 2, 4, 6, 8, -1,-1,-1,-1, 2, 4, 6, 8 };
+static const int16_t ADPCM_STEP[89] = {
+  7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,
+  107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,
+  876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,
+  4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,
+  22385,24623,27086,29794,32767
+};
+// Codec state lives in globals: struct-typed function parameters break
+// Arduino's auto-generated prototypes (same trap as RawPkt in v13/v15).
+static int32_t adpcmEncPred = 0; static int adpcmEncIdx = 0;
+static int32_t adpcmDecPred = 0; static int adpcmDecIdx = 0;
+static void adpcmEncReset() { adpcmEncPred = 0; adpcmEncIdx = 0; }
+static void adpcmDecReset() { adpcmDecPred = 0; adpcmDecIdx = 0; }
+static uint8_t adpcmEncodeSample(int16_t in) {
+  int32_t step = ADPCM_STEP[adpcmEncIdx];
+  int32_t diff = (int32_t)in - adpcmEncPred;
+  uint8_t code = 0;
+  if (diff < 0) { code = 8; diff = -diff; }
+  int32_t vpdiff = step >> 3;
+  if (diff >= step)      { code |= 4; diff -= step;      vpdiff += step; }
+  if (diff >= (step >> 1)) { code |= 2; diff -= (step >> 1); vpdiff += (step >> 1); }
+  if (diff >= (step >> 2)) { code |= 1; vpdiff += (step >> 2); }
+  adpcmEncPred += (code & 8) ? -vpdiff : vpdiff;
+  if (adpcmEncPred > 32767) adpcmEncPred = 32767; else if (adpcmEncPred < -32768) adpcmEncPred = -32768;
+  adpcmEncIdx += ADPCM_IDX[code];
+  if (adpcmEncIdx < 0) adpcmEncIdx = 0; else if (adpcmEncIdx > 88) adpcmEncIdx = 88;
+  return code;
+}
+static int16_t adpcmDecodeSample(uint8_t code) {
+  int32_t step = ADPCM_STEP[adpcmDecIdx];
+  int32_t vpdiff = step >> 3;
+  if (code & 4) vpdiff += step;
+  if (code & 2) vpdiff += (step >> 1);
+  if (code & 1) vpdiff += (step >> 2);
+  adpcmDecPred += (code & 8) ? -vpdiff : vpdiff;
+  if (adpcmDecPred > 32767) adpcmDecPred = 32767; else if (adpcmDecPred < -32768) adpcmDecPred = -32768;
+  adpcmDecIdx += ADPCM_IDX[code & 0x0F];
+  if (adpcmDecIdx < 0) adpcmDecIdx = 0; else if (adpcmDecIdx > 88) adpcmDecIdx = 88;
+  return (int16_t)adpcmDecPred;
+}
+
+// ---- voice state (UI reads snapshots only; the play task owns I2S) ----
+static QueueHandle_t vRxQueue = nullptr;
+struct VoiceBlk { uint8_t len; uint8_t data[V_ADPCM]; };
+static volatile bool vRxPlaying = false;
+static bool     vRxOpen = false;         // a stream is being received
+static char     vRxName[16] = "";
+static unsigned long vRxStartAt = 0, vRxLastBlkAt = 0;
+static uint32_t vRxBlocks = 0;
+static uint8_t  vRxExpectSeq = 0;
+static bool     vTxActive = false;
+static unsigned long vTxStartAt = 0, vLastTKeyAt = 0;
+static uint8_t  vTxSeq = 0;
+static bool     vMicReady = false, vSpkReady = false, vCodecFound = false;
+static int16_t  vAcc[V_SAMPLES];
+static int      vAccN = 0;
+static int32_t  vDecimPrev = 0;
+static bool     vDecimHave = false;
+
+static bool spkInit() {
+  if (vSpkReady) return true;
+  i2s_config_t c = {};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate = 8000;
+  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  c.dma_buf_count = 8;
+  c.dma_buf_len = 256;
+  i2s_pin_config_t p = {};
+  p.mck_io_num = I2S_PIN_NO_CHANGE;
+  p.bck_io_num = PIN_I2S_BCK;
+  p.ws_io_num = PIN_I2S_WS;
+  p.data_out_num = PIN_I2S_DOUT;
+  p.data_in_num = I2S_PIN_NO_CHANGE;
+  if (i2s_driver_install(I2S_NUM_0, &c, 0, nullptr) != ESP_OK) return false;
+  if (i2s_set_pin(I2S_NUM_0, &p) != ESP_OK) return false;
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  vSpkReady = true;
+  return true;
+}
+
+static void voicePlayTask(void*) {
+  static int16_t pcm[V_SAMPLES];
+  static int16_t st[V_SAMPLES * 2];
+  VoiceBlk blk;
+  for (;;) {
+    if (xQueueReceive(vRxQueue, &blk, pdMS_TO_TICKS(120)) == pdTRUE) {
+      if (!spkInit()) continue;
+      vRxPlaying = true;
+      for (int i = 0; i < V_SAMPLES; i++) {
+        uint8_t byte = (i >> 1) < blk.len ? blk.data[i >> 1] : 0;
+        uint8_t code = (i & 1) ? (byte & 0x0F) : (byte >> 4);
+        pcm[i] = adpcmDecodeSample(code);
+      }
+      for (int i = 0; i < V_SAMPLES; i++) { st[2 * i] = pcm[i]; st[2 * i + 1] = pcm[i]; }
+      size_t wr = 0;
+      i2s_write(I2S_NUM_0, st, sizeof(st), &wr, pdMS_TO_TICKS(250));
+    } else if (vRxPlaying) {
+      i2s_zero_dma_buffer(I2S_NUM_0);
+      vRxPlaying = false;
+    }
+  }
+}
+
+static void voiceEnsureInit() {
+  if (!vRxQueue) {
+    vRxQueue = xQueueCreate(24, sizeof(VoiceBlk));
+    xTaskCreate(voicePlayTask, "voicePlay", 4096, nullptr, 3, nullptr);
+  }
+}
+
+static void voiceRx(const uint8_t* data, int len, int peerIdx) {
+  (void)peerIdx;
+  if (vTxActive) return;                          // half-duplex: own TX wins
+  if (len < 26) return;
+  const VoicePkt* vp = (const VoicePkt*)data;
+  if (vp->len > V_ADPCM) return;
+  voiceEnsureInit();
+  unsigned long now = millis();
+  if ((vp->flags & V_FLAG_START) || !vRxOpen || vp->seq != vRxExpectSeq) {
+    adpcmDecReset();                               // (re)sync decoder
+    strncpy(vRxName, vp->name, 15); vRxName[15] = 0;
+    if (!vRxOpen || (vp->flags & V_FLAG_START)) { vRxStartAt = now; vRxBlocks = 0; }
+    vRxOpen = true;
+  }
+  vRxExpectSeq = vp->seq + 1;
+  vRxLastBlkAt = now;
+  if (vp->len > 0) {
+    VoiceBlk blk; blk.len = vp->len;
+    memcpy(blk.data, vp->data, vp->len);
+    if (xQueueSend(vRxQueue, &blk, 0) == pdTRUE) vRxBlocks++;
+  }
+  if (screen == SC_VOICE) needsRedraw = true;
+}
+
+// ---- ES7210 mic codec ----
+static void es7210Write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(ES7210_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+static uint8_t es7210Read(uint8_t reg) {
+  Wire.beginTransmission(ES7210_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)ES7210_ADDR, (size_t)1);
+  return Wire.available() ? (uint8_t)Wire.read() : 0;
+}
+static void es7210Update(uint8_t reg, uint8_t mask, uint8_t data) {
+  uint8_t v = es7210Read(reg);
+  es7210Write(reg, (uint8_t)((v & ~mask) | (mask & data)));
+}
+static void es7210MicSelectAll() {          // driver's mic_select, all 4 mics
+  for (int i = 0; i < 4; i++) es7210Update(0x43 + i, 0x10, 0x00);
+  es7210Write(0x4B, 0xFF);
+  es7210Write(0x4C, 0xFF);
+  es7210Update(0x01, 0x0B, 0x00); es7210Write(0x4B, 0x00); es7210Update(0x43, 0x10, 0x10);  // MIC1
+  es7210Update(0x01, 0x0B, 0x00); es7210Write(0x4B, 0x00); es7210Update(0x44, 0x10, 0x10);  // MIC2
+  es7210Update(0x01, 0x15, 0x00); es7210Write(0x4C, 0x00); es7210Update(0x45, 0x10, 0x10);  // MIC3
+  es7210Update(0x01, 0x15, 0x00); es7210Write(0x4C, 0x00); es7210Update(0x46, 0x10, 0x10);  // MIC4
+}
+// Init sequence follows LilyGo's official es7210 driver (es7210.cpp) for
+// SLAVE mode at 16 kHz: ESP32 supplies MCLK = 16k x 256 = 4.096 MHz on
+// GPIO48, so the clock coefficients are the {4096000, 16000} table row.
+static bool es7210Init() {
+  Wire.beginTransmission(ES7210_ADDR);
+  if (Wire.endTransmission() != 0) { vCodecFound = false; return false; }
+  vCodecFound = true;
+  es7210Write(0x00, 0xFF);                    // reset
+  es7210Write(0x00, 0x41);
+  es7210Write(0x01, 0x1F);                    // clocks off
+  es7210Write(0x09, 0x30);                    // state cycle timing
+  es7210Write(0x0A, 0x30);
+  // (codec is I2S slave: no master-mode writes to 0x08 / 0x03)
+  es7210Write(0x40, 0xC3);                    // analog
+  es7210Write(0x41, 0x70);                    // mic bias 2.87 V
+  es7210Write(0x42, 0x70);
+  es7210Write(0x07, 0x20);                    // OSR
+  es7210Write(0x02, 0xC1);                    // mainclk (16k row)
+  es7210Write(0x04, 0x01);                    // LRCK div H
+  es7210Write(0x05, 0x00);                    // LRCK div L
+  es7210MicSelectAll();
+  for (int i = 0; i < 4; i++) es7210Update(0x43 + i, 0x0F, 0x00);   // gain 0 dB first
+  // config_i2s: 16-bit, normal I2S format, SDOUT routing, sample again
+  es7210Write(0x11, (uint8_t)((es7210Read(0x11) & 0x1F) | 0x60));
+  es7210Write(0x11, (uint8_t)(es7210Read(0x11) & 0xFC));
+  es7210Write(0x12, 0x00);
+  es7210Write(0x02, 0xC1);
+  es7210Write(0x07, 0x20);
+  es7210Write(0x04, 0x01);
+  es7210Write(0x05, 0x00);
+  // mic gains: 24 dB on all channels (tune after hardware test)
+  for (int i = 0; i < 4; i++) es7210Update(0x43 + i, 0x0F, 8);
+  // start: restore clock register, power up, select mics again
+  es7210Write(0x01, es7210Read(0x01));
+  es7210Write(0x06, 0x00);
+  es7210Write(0x47, 0x00);
+  es7210Write(0x48, 0x00);
+  es7210Write(0x49, 0x00);
+  es7210Write(0x4A, 0x00);
+  es7210MicSelectAll();
+  return true;
+}
+
+static bool micInit() {
+  if (vMicReady) return true;
+  if (!es7210Init()) return false;
+  i2s_config_t c = {};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  c.sample_rate = 16000;
+  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  c.dma_buf_count = 8;
+  c.dma_buf_len = 256;
+  c.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+  i2s_pin_config_t p = {};
+  p.mck_io_num = PIN_ES_MCLK;
+  p.bck_io_num = PIN_ES_SCK;
+  p.ws_io_num = PIN_ES_LRCK;
+  p.data_out_num = I2S_PIN_NO_CHANGE;
+  p.data_in_num = PIN_ES_DIN;
+  if (i2s_driver_install(I2S_NUM_1, &c, 0, nullptr) != ESP_OK) return false;
+  if (i2s_set_pin(I2S_NUM_1, &p) != ESP_OK) return false;
+  vMicReady = true;
+  return true;
+}
+
+static void voiceSendPkt(uint8_t flags, const uint8_t* adpcm, uint8_t n) {
+  VoicePkt vp; memset(&vp, 0, sizeof(vp));
+  vp.type = 3;
+  { String nm = u8cut(myName, 15); strncpy(vp.name, nm.c_str(), 15); }
+  vp.seq = vTxSeq++;
+  vp.flags = flags;
+  vp.len = n;
+  if (adpcm && n) memcpy(vp.data, adpcm, n);
+  esp_now_send(BCAST_MAC, (uint8_t*)&vp, sizeof(vp));
+}
+
+static String voiceDurStr(unsigned long ms) {
+  int s = (int)((ms + 500) / 1000);
+  if (s < 1) s = 1;
+  return String("(voice ") + String(s) + String("s)");
+}
+
+static void voiceTick() {
+  unsigned long now = millis();
+  // ---- RX stream finalisation -> chat log line ----
+  if (vRxOpen && !vRxPlaying && now - vRxLastBlkAt > 900) {
+    String line = voiceDurStr(vRxLastBlkAt - vRxStartAt + 49);
+    appendGroupLog(String(vRxName), line);
+    termPush(String(vRxName), line);
+    int gi = ensureGroupPeer();
+    if (gi >= 0 && screen != SC_HOME && screen != SC_CHAT) chatPeers[gi].hasUnread = true;
+    vRxOpen = false;
+    if (screen == SC_VOICE) needsRedraw = true;
+  }
+  // ---- PTT state ----
+  bool wantTx = false;
+  if (screen == SC_VOICE && chatOn && !vRxPlaying && !vRxOpen) {
+    if (now - vLastTKeyAt < 400 && vLastTKeyAt) wantTx = true;
+    int tx, ty;
+    if (gtTouch(&tx, &ty) && tx >= 25 && tx <= 295 && ty >= 78 && ty <= 188) wantTx = true;
+  }
+  if (wantTx && !vTxActive) {
+    if (micInit()) {
+      vTxActive = true;
+      vTxStartAt = now;
+      vTxSeq = 0;
+      adpcmEncReset();
+      vAccN = 0; vDecimHave = false;
+      voiceSendPkt(V_FLAG_START, nullptr, 0);
+      if (screen == SC_VOICE) needsRedraw = true;
+    }
+  } else if (!wantTx && vTxActive) {
+    voiceSendPkt(V_FLAG_END, nullptr, 0);
+    vTxActive = false;
+    String line = voiceDurStr(now - vTxStartAt);
+    appendGroupLog("Me", line);
+    termPush("Me", line);
+    if (screen == SC_VOICE) needsRedraw = true;
+  }
+  // ---- TX pump: mic 16 kHz -> decimate -> ADPCM -> packets ----
+  if (vTxActive) {
+    static int16_t fr[512 * 2];
+    static uint8_t out[V_ADPCM];
+    for (int iter = 0; iter < 6; iter++) {
+      size_t br = 0;
+      if (i2s_read(I2S_NUM_1, fr, sizeof(fr), &br, 0) != ESP_OK || br == 0) break;
+      int frames = (int)(br / 4);
+      for (int i = 0; i < frames; i++) {
+        int32_t s = ((int32_t)fr[2 * i] + fr[2 * i + 1]) / 2;   // ADC1+ADC2 slots averaged
+        if (!vDecimHave) { vDecimPrev = s; vDecimHave = true; continue; }
+        vAcc[vAccN++] = (int16_t)((vDecimPrev + s) / 2);
+        vDecimHave = false;
+        if (vAccN >= V_SAMPLES) {
+          for (int j = 0; j < V_SAMPLES; j += 2) {
+            uint8_t hi = adpcmEncodeSample(vAcc[j]);
+            uint8_t lo = adpcmEncodeSample(vAcc[j + 1]);
+            out[j / 2] = (uint8_t)((hi << 4) | lo);
+          }
+          voiceSendPkt(0, out, V_ADPCM);
+          vAccN = 0;
+        }
+      }
+      if (now - vTxStartAt > 60000) break;           // 60 s hard cap per burst
+    }
+  }
+}
+
+static void vTxtC(const char* s, int cx, int y, uint16_t color, int size) {
+  txt(s, cx - txtW(s, size) / 2, y, color, size);
+}
+static void drawVoice() {
+  drawHeader("VOICE PTT");
+  if (!vCodecFound && !vMicReady) txt("Mic: ES7210 (checked on first TX)", 14, 34, UI_MUTE, 1);
+  else if (vCodecFound) txt("Mic: ES7210 OK", 14, 34, UI_MUTE, 1);
+  else txt("Mic: ES7210 NOT FOUND", 14, 34, UI_BAD, 1);
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Online peers: %d", onlinePeerCount());
+  txt(buf, 14, 50, UI_MUTE, 1);
+  bool txing = vTxActive;
+  Lcd.fillRoundRect(25, 78, 270, 110, 10, txing ? UI_BAD : UI_CARD);
+  Lcd.drawRoundRect(25, 78, 270, 110, 10, txing ? UI_BAD : UI_ACCENT);
+  if (txing) {
+    vTxtC("TX - TALK NOW", 160, 105, UI_TEXT, 2);
+    snprintf(buf, sizeof(buf), "%lu s", (unsigned long)((millis() - vTxStartAt) / 1000));
+    vTxtC(buf, 160, 140, UI_TEXT, 2);
+  } else if (vRxPlaying || vRxOpen) {
+    vTxtC("RX", 160, 105, UI_ACCENT, 2);
+    vTxtC(vRxName, 160, 140, UI_TEXT, 2);
+  } else {
+    vTxtC("HOLD TO TALK", 160, 105, UI_TEXT, 2);
+    vTxtC("(touch here or hold T key)", 160, 145, UI_MUTE, 1);
+  }
+  txt("Group voice: everyone hears everyone.", 14, 205, UI_MUTE, 1);
+  txt("Esc: back", 14, 221, UI_MUTE, 1);
+  if (txing || vRxPlaying) needsRedraw = true;   // live timer / state
 }
 
 // ============================================================
@@ -1810,6 +2194,7 @@ static void drawCurrent() {
     case SC_GPS: drawGps(); break;
     case SC_MAP: drawMap(); break;
     case SC_SCAN: drawScan(); break;
+    case SC_VOICE: drawVoice(); break;
   }
 }
 static void goHome() { screen = SC_HOME; needsRedraw = true; }
@@ -1880,7 +2265,12 @@ static void handleKey(int c) {
       else if (c == 'g' || c == 'G') { screen = SC_GPS; needsRedraw = true; }
       else if (c == 'm' || c == 'M') { mapRecenterGps(); screen = SC_MAP; needsRedraw = true; }
       else if (c == 's' || c == 'S') { scanEnter(); screen = SC_SCAN; needsRedraw = true; }
+      else if (c == 'v' || c == 'V') { voiceEnsureInit(); screen = SC_VOICE; needsRedraw = true; }
       else if (c == 0x1B) goHome();
+      break;
+    case SC_VOICE:
+      if (c == 't' || c == 'T') { vLastTKeyAt = millis(); }
+      else if (c == 0x1B || c == 0x0D) { screen = SC_PEERS; needsRedraw = true; }
       break;
     case SC_RAW:
       if (c == 0x1B || c == 0x0D) { screen = SC_PEERS; needsRedraw = true; }
@@ -1976,6 +2366,9 @@ static void handleTouch(int tx, int ty) {
       break;
     case SC_SCAN:
       if (ty < 24 && tx < 50) { scanExit(); screen = SC_PEERS; needsRedraw = true; }
+      break;
+    case SC_VOICE:
+      if (ty < 24 && tx < 50) { screen = SC_PEERS; needsRedraw = true; }
       break;
     case SC_RADIO:
       if (ty < 24 && tx < 50) { goHome(); break; }
@@ -2098,7 +2491,7 @@ void setup() {
   Lcd.begin(1, (uint8_t)brightnessVal);   // official init: CS pre-deselect + rotation 1
   Lcd.invertDisplay(true);               // this panel batch needs INVON, else colours are inverted
   Lcd.fillScreen(UI_BG);
-  bootType("C:\\> BOOT  ENZ T-DECK v15", 12, 8, UI_ACCENT);
+  bootType("C:\\> BOOT  ENZ T-DECK v16", 12, 8, UI_ACCENT);
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
   sdReady = SD.begin(PIN_SD_CS, SPI, 20000000);
   bootLine(sdReady ? "SD card ............ OK" : "SD card ............ NONE");
@@ -2203,6 +2596,7 @@ void loop() {
   loraPoll();
   gpsPoll();
   sosTick();
+  voiceTick();
   if (screen == SC_SCAN) scanTick();
   if (screen == SC_RADIO) fmPoll();
   if (screen == SC_HOME) { homeTick(); cursorShow(); }

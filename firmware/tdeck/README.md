@@ -1,4 +1,4 @@
-# LILYGO T-Deck コンパニオン — v15「無線番長」
+# LILYGO T-Deck コンパニオン — v16「無線番長」
 
 物理キーボード + トラックボール搭載の**無線専用端末**。
 ESP-NOW / LoRa / MeshCore 監視 / FM ラジオ / GPS(Plus)を
@@ -38,12 +38,18 @@ ESP-NOW / LoRa / MeshCore 監視 / FM ラジオ / GPS(Plus)を
 - RAW ログの SD 保存(v15): MeshCore モードで受信した生パケットを
   /meshcore_raw.log に全件記録(時刻・長さ・RSSI・全 HEX)。
   帰宅後に PC でデコード解析するためのもの(1 MB で自動リスタート)
+- 音声 PTT(v16): グループ音声通話。VOICE 画面で大きなボタンを
+  長押し(または T キー長押し)している間だけ送信する半二重方式。
+  マイクは ES7210 コーデック、再生は内蔵スピーカー。
+  方式は IMA-ADPCM 8 kHz を ESP-NOW type 3 で約 20 パケット/秒。
+  通話はチャットログに「(voice Ns)」として残る。LoRa では送らない
 
 ## 画面とキー
 
 - ホーム: CHAT(ピア一覧)/ MAP / FM / SET ボタン、ターミナルで入力 → Enter で送信。
   ステータスカードをタップすると RF スキャナが開く
-- ピア一覧: Enter = 会話、R = RAW ログ、F = FM、G = GPS、M = 地図、S = RF スキャナ
+- ピア一覧: Enter = 会話、R = RAW ログ、F = FM、G = GPS、M = 地図、S = RF スキャナ、V = 音声 PTT
+- 音声画面: PTT ゾーンを長押し、または T キー長押しで送信。Esc = 戻る
 - FM 画面: `,` / `.` = シーク、- / = = 音量
 - GPS 画面: Enter / B = 位置ビーコン送信、S = SOS(2 回押しで発報、
   発報中はもう一度押すと停止)。SOS ボタンはタップでも操作できる
