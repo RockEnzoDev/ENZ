@@ -1,5 +1,5 @@
 // ============================================================
-//  ENZ T-DECK v17 "RADIO BANCHO" -- LILYGO T-Deck companion
+//  ENZ T-DECK v18 "RADIO BANCHO" -- LILYGO T-Deck companion
 //  The all-radio terminal of the ENZ CoT family: ESP-NOW chat
 //  (byte-compatible with CYD / M5Core2), LoRa text + MeshCore
 //  monitor, Si4703 FM radio (RDS), and on the T-Deck Plus an
@@ -15,6 +15,9 @@
 //  v17: voice gain pass after the first hardware test (voice was
 //  audible but faint): mic PGA 24 dB -> 36 dB, playback gain
 //  x1..x4 with saturation, Settings row "Voice Vol" (pref vgain).
+//  v18: TX-side conditioning before ADPCM (v17 check showed the
+//  bottleneck is capture S/N, not playback): one-pole high-pass
+//  (~250 Hz), RMS noise gate, and x2 digital gain with clamp.
 // ============================================================
 #include <Arduino.h>
 #define LILYGO_LGFX_USE_T_DECK
@@ -601,6 +604,41 @@ static int32_t adpcmEncPred = 0; static int adpcmEncIdx = 0;
 static int32_t adpcmDecPred = 0; static int adpcmDecIdx = 0;
 static void adpcmEncReset() { adpcmEncPred = 0; adpcmEncIdx = 0; }
 static void adpcmDecReset() { adpcmDecPred = 0; adpcmDecIdx = 0; }
+
+// ---- v18: TX conditioning, applied to each 8 kHz block before ADPCM ----
+// The v17 hardware check isolated the problem to capture-side S/N:
+// raising playback gain raised the noise with the voice. So the TX
+// path now (1) high-passes rumble/DC, (2) gates quiet blocks down so
+// inter-word hiss is not transmitted at full level, (3) applies x2
+// digital gain so speech lands higher in the ADPCM range.
+static float vHpX = 0, vHpY = 0;        // high-pass state
+static float vGateGain = 0.25f;         // smoothed gate gain 0.25..1
+static void voiceTxReset() { vHpX = 0; vHpY = 0; vGateGain = 0.25f; }
+static void voiceTxProcess(int16_t* b, int n) {
+  // (1) one-pole high-pass, alpha 0.84 -> fc ~250 Hz at 8 kHz
+  for (int i = 0; i < n; i++) {
+    float x = (float)b[i];
+    float y = 0.84f * (vHpY + x - vHpX);
+    vHpX = x; vHpY = y;
+    b[i] = (int16_t)y;
+  }
+  // (2) block RMS -> gate target (hysteresis band 250..500)
+  int64_t acc = 0;
+  for (int i = 0; i < n; i++) acc += (int32_t)b[i] * b[i];
+  float rms = sqrtf((float)(acc / n));
+  float target = 0.25f;
+  if (rms > 500.0f) target = 1.0f;
+  else if (rms > 250.0f) target = 0.25f + 0.75f * (rms - 250.0f) / 250.0f;
+  // (3) ramp the gate gain across the block, x2 makeup gain, clamp
+  float g0 = vGateGain, g1 = g0 + (target - g0) * 0.6f;
+  vGateGain = g1;
+  for (int i = 0; i < n; i++) {
+    float g = (g0 + (g1 - g0) * (float)i / (float)n) * 2.0f;
+    int32_t v = (int32_t)((float)b[i] * g);
+    if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+    b[i] = (int16_t)v;
+  }
+}
 static uint8_t adpcmEncodeSample(int16_t in) {
   int32_t step = ADPCM_STEP[adpcmEncIdx];
   int32_t diff = (int32_t)in - adpcmEncPred;
@@ -868,6 +906,7 @@ static void voiceTick() {
       vTxStartAt = now;
       vTxSeq = 0;
       adpcmEncReset();
+      voiceTxReset();
       vAccN = 0; vDecimHave = false;
       voiceSendPkt(V_FLAG_START, nullptr, 0);
       if (screen == SC_VOICE) needsRedraw = true;
@@ -894,6 +933,7 @@ static void voiceTick() {
         vAcc[vAccN++] = (int16_t)((vDecimPrev + s) / 2);
         vDecimHave = false;
         if (vAccN >= V_SAMPLES) {
+          voiceTxProcess(vAcc, V_SAMPLES);
           for (int j = 0; j < V_SAMPLES; j += 2) {
             uint8_t hi = adpcmEncodeSample(vAcc[j]);
             uint8_t lo = adpcmEncodeSample(vAcc[j + 1]);
