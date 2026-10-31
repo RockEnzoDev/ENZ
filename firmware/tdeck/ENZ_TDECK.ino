@@ -1,5 +1,5 @@
 // ============================================================
-//  ENZ T-DECK v16 "RADIO BANCHO" -- LILYGO T-Deck companion
+//  ENZ T-DECK v17 "RADIO BANCHO" -- LILYGO T-Deck companion
 //  The all-radio terminal of the ENZ CoT family: ESP-NOW chat
 //  (byte-compatible with CYD / M5Core2), LoRa text + MeshCore
 //  monitor, Si4703 FM radio (RDS), and on the T-Deck Plus an
@@ -12,6 +12,9 @@
 //  logging to SD (/meshcore_raw.log) for later PC decoding.
 //  v16 adds: group voice PTT (MsgPacket type 3, IMA-ADPCM
 //  8 kHz over ESP-NOW, ES7210 mic in, MAX98357A speaker out).
+//  v17: voice gain pass after the first hardware test (voice was
+//  audible but faint): mic PGA 24 dB -> 36 dB, playback gain
+//  x1..x4 with saturation, Settings row "Voice Vol" (pref vgain).
 // ============================================================
 #include <Arduino.h>
 #define LILYGO_LGFX_USE_T_DECK
@@ -668,6 +671,7 @@ static bool spkInit() {
   return true;
 }
 
+static int voiceGain = 2;   // v17: playback gain x1..x4 (pref "sys"/"vgain"), applied with saturation in voicePlayTask
 static void voicePlayTask(void*) {
   static int16_t pcm[V_SAMPLES];
   static int16_t st[V_SAMPLES * 2];
@@ -681,7 +685,11 @@ static void voicePlayTask(void*) {
         uint8_t code = (i & 1) ? (byte & 0x0F) : (byte >> 4);
         pcm[i] = adpcmDecodeSample(code);
       }
-      for (int i = 0; i < V_SAMPLES; i++) { st[2 * i] = pcm[i]; st[2 * i + 1] = pcm[i]; }
+      for (int i = 0; i < V_SAMPLES; i++) {
+        int32_t s = (int32_t)pcm[i] * voiceGain;
+        if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+        st[2 * i] = (int16_t)s; st[2 * i + 1] = (int16_t)s;
+      }
       size_t wr = 0;
       i2s_write(I2S_NUM_0, st, sizeof(st), &wr, pdMS_TO_TICKS(250));
     } else if (vRxPlaying) {
@@ -779,8 +787,9 @@ static bool es7210Init() {
   es7210Write(0x07, 0x20);
   es7210Write(0x04, 0x01);
   es7210Write(0x05, 0x00);
-  // mic gains: 24 dB on all channels (tune after hardware test)
-  for (int i = 0; i < 4; i++) es7210Update(0x43 + i, 0x0F, 8);
+  // mic gains: 36 dB on all channels (v17: was 24 dB in v16, voice
+  // came through faint on hardware; 3 dB/step, code 12 = 36 dB)
+  for (int i = 0; i < 4; i++) es7210Update(0x43 + i, 0x0F, 12);
   // start: restore clock register, power up, select mics again
   es7210Write(0x01, es7210Read(0x01));
   es7210Write(0x06, 0x00);
@@ -2182,6 +2191,7 @@ static void drawSettings() {
   row("Bright", String(brightnessVal));
   row("Cursor", cursorMode == 0 ? "Auto" : (cursorMode == 1 ? "ON" : "OFF"));
   row("LoRa", loraProf == 1 ? "Narrow" : (loraProf == 2 ? "MeshCore" : "Std"));
+  row("Voice Vol", "x" + String(voiceGain));
 }
 static void drawCurrent() {
   switch (screen) {
@@ -2398,7 +2408,7 @@ static void handleTouch(int tx, int ty) {
       }
       if (ty < 24 && tx < 50) { goHome(); break; }
       int rowIdx = (ty - 28) / 22;
-      if (ty >= 28 && rowIdx >= 0 && rowIdx < 7) {
+      if (ty >= 28 && rowIdx >= 0 && rowIdx < 8) {
         if (rowIdx == 0) { editingName = true; editBuf = myName; }
         else if (rowIdx == 1) { if (chatOn) chatStop(); else chatStart(); }
         else if (rowIdx == 2) { chatChannel = chatChannel % 13 + 1; saveChatPrefs(); if (chatOn) { chatStop(); chatStart(); } }
@@ -2416,6 +2426,10 @@ static void handleTouch(int tx, int ty) {
           loraProf = (loraProf + 1) % 3;
           saveChatPrefs();
           loraInit();
+        }
+        else if (rowIdx == 7) {
+          voiceGain = voiceGain % 4 + 1;
+          prefs.begin("sys", false); prefs.putInt("vgain", voiceGain); prefs.end();
         }
         needsRedraw = true;
       }
@@ -2485,6 +2499,8 @@ void setup() {
   prefs.begin("sys", true); cursorMode = prefs.getInt("cur", 0); prefs.end();
   if (cursorMode < 0 || cursorMode > 2) cursorMode = 0;
   prefs.begin("sys", true); brightnessVal = prefs.getInt("bright", 200); prefs.end();
+  prefs.begin("sys", true); voiceGain = prefs.getInt("vgain", 2); prefs.end();
+  if (voiceGain < 1 || voiceGain > 4) voiceGain = 2;
   loadFmPrefs();
   loadMapPrefs();
   setenv("TZ", "JST-9", 1); tzset();
